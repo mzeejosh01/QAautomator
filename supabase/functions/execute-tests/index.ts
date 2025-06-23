@@ -194,12 +194,23 @@ async function executeRealTests(
   environmentUrl: string,
   onProgress: (update: any) => void
 ) {
-  console.log(`Starting REAL execution of ${testCaseIds.length} tests on ${environmentUrl}`)
+  console.log(`Starting execution of ${testCaseIds.length} tests on ${environmentUrl}`)
   
   const results: TestResult[] = []
   const startTime = Date.now()
   let passedCount = 0
   let failedCount = 0
+  let browserSession: any = null
+  let page: any = null
+
+  // Validate inputs
+  if (!testCaseIds.length) {
+    onProgress({
+      type: 'error',
+      error: 'No test cases provided for execution'
+    })
+    return
+  }
 
   // Get test cases from database
   const { data: testCases, error: testCasesError } = await supabaseClient
@@ -210,18 +221,77 @@ async function executeRealTests(
   if (testCasesError || !testCases) {
     onProgress({
       type: 'error',
-      error: 'Failed to fetch test cases'
+      error: `Failed to fetch test cases: ${testCasesError?.message || 'Unknown error'}`
+    })
+    return
+  }
+
+  if (testCases.length === 0) {
+    onProgress({
+      type: 'error',
+      error: 'No test cases found with the provided IDs'
     })
     return
   }
 
   try {
-    // Initialize browser session via Browserless API or local Playwright
-    const browser = await initializeBrowser(browserType)
+    // Initialize browser with retry logic
+    let initAttempts = 0
+    const maxInitAttempts = 3
     
+    while (initAttempts < maxInitAttempts) {
+      try {
+        console.log(`Browser initialization attempt ${initAttempts + 1}/${maxInitAttempts}`)
+        browserSession = await initializeBrowser(browserType)
+        
+        // Test browser health
+        const isHealthy = await checkBrowserHealth(browserSession)
+        if (!isHealthy) {
+          throw new Error('Browser session health check failed')
+        }
+        
+        console.log(`Browser initialized successfully: ${browserSession.type}`)
+        break
+        
+      } catch (error) {
+        initAttempts++
+        console.error(`Browser init attempt ${initAttempts} failed:`, error)
+        
+        if (initAttempts >= maxInitAttempts) {
+          throw new Error(`Failed to initialize browser after ${maxInitAttempts} attempts: ${error.message}`)
+        }
+        
+        // Exponential backoff before retry
+        await new Promise(resolve => setTimeout(resolve, 2000 * initAttempts))
+      }
+    }
+    
+    // Create page with retry logic
+    let pageAttempts = 0
+    const maxPageAttempts = 2
+    
+    while (pageAttempts < maxPageAttempts) {
+      try {
+        page = await createPageFromSession(browserSession)
+        console.log('Page created successfully')
+        break
+        
+      } catch (error) {
+        pageAttempts++
+        console.error(`Page creation attempt ${pageAttempts} failed:`, error)
+        
+        if (pageAttempts >= maxPageAttempts) {
+          throw new Error(`Failed to create page after ${maxPageAttempts} attempts: ${error.message}`)
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, 1000))
+      }
+    }
+    
+    // Execute tests with error recovery
     for (let i = 0; i < testCases.length; i++) {
       const testCase = testCases[i]
-      console.log(`Executing REAL test ${i + 1}/${testCases.length}: ${testCase.name}`)
+      console.log(`Executing test ${i + 1}/${testCases.length}: ${testCase.name}`)
       
       const executionStartTime = Date.now()
       
@@ -234,78 +304,139 @@ async function executeRealTests(
         status: 'running'
       })
       
-      // Execute the REAL test
-      const result = await executeIndividualTest(
-        browser,
-        testCase,
-        environmentUrl,
-        executionStartTime
-      )
+      let result: TestResult
+      let testAttempts = 0
+      const maxTestAttempts = 2
       
-      if (result.status === 'pass') {
+      // Execute individual test with retry
+      while (testAttempts < maxTestAttempts) {
+        try {
+          result = await executeIndividualTest(
+            browserSession,
+            page,
+            testCase,
+            environmentUrl,
+            executionStartTime
+          )
+          break
+          
+        } catch (error) {
+          testAttempts++
+          console.error(`Test execution attempt ${testAttempts} failed:`, error)
+          
+          if (testAttempts >= maxTestAttempts) {
+            // Create failed result
+            result = {
+              test_case_id: testCase.id,
+              status: 'fail',
+              execution_time: Date.now() - executionStartTime,
+              error_message: `Test failed after ${maxTestAttempts} attempts: ${error.message}`,
+              logs: [`Test execution failed: ${error.message}`]
+            }
+          } else {
+            // Attempt page recovery
+            try {
+              await page.reload()
+              await new Promise(resolve => setTimeout(resolve, 2000))
+            } catch (reloadError) {
+              console.error('Page reload failed:', reloadError)
+              // Try to create new page
+              try {
+                page = await createPageFromSession(browserSession)
+              } catch (newPageError) {
+                console.error('New page creation failed:', newPageError)
+                // If page recovery fails, fail the test
+                result = {
+                  test_case_id: testCase.id,
+                  status: 'fail',
+                  execution_time: Date.now() - executionStartTime,
+                  error_message: `Page recovery failed: ${newPageError.message}`,
+                  logs: [`Page recovery failed: ${newPageError.message}`]
+                }
+                break
+              }
+            }
+          }
+        }
+      }
+      
+      if (result!.status === 'pass') {
         passedCount++
       } else {
         failedCount++
       }
 
-      results.push(result)
+      results.push(result!)
 
-      // Store test result in database
-      const { error: resultError } = await supabaseClient
-        .from('test_results')
-        .insert({
-          test_run_id: testRunId,
-          test_case_id: testCase.id,
-          status: result.status,
-          duration_seconds: Math.round(result.execution_time / 1000),
-          error_message: result.error_message,
-          logs: result.logs.join('\n'),
-          screenshots: result.screenshot_url ? [result.screenshot_url] : [],
-          executed_at: new Date().toISOString()
-        })
+      // Store test result in database with error handling
+      try {
+        const { error: resultError } = await supabaseClient
+          .from('test_results')
+          .insert({
+            test_run_id: testRunId,
+            test_case_id: testCase.id,
+            status: result!.status,
+            duration_seconds: Math.round(result!.execution_time / 1000),
+            error_message: result!.error_message,
+            logs: result!.logs?.join('\n') || '',
+            screenshots: result!.screenshot_url ? [result!.screenshot_url] : [],
+            executed_at: new Date().toISOString()
+          })
 
-      if (resultError) {
-        console.error('Failed to store test result:', resultError)
+        if (resultError) {
+          console.error('Failed to store test result:', resultError)
+        }
+      } catch (dbError) {
+        console.error('Database operation failed:', dbError)
       }
 
-      // Update test run progress
-      await supabaseClient
-        .from('test_runs')
-        .update({
-          passed_tests: passedCount,
-          failed_tests: failedCount,
-        })
-        .eq('id', testRunId)
+      // Update test run progress with error handling
+      try {
+        await supabaseClient
+          .from('test_runs')
+          .update({
+            passed_tests: passedCount,
+            failed_tests: failedCount,
+          })
+          .eq('id', testRunId)
+      } catch (updateError) {
+        console.error('Failed to update test run progress:', updateError)
+      }
 
       onProgress({
         type: 'test_complete',
         testCaseId: testCase.id,
         testName: testCase.name,
-        status: result.status,
-        error: result.error_message,
-        screenshot: result.screenshot_url,
+        status: result!.status,
+        error: result!.error_message,
+        screenshot: result!.screenshot_url,
         passed: passedCount,
         failed: failedCount,
         total: testCases.length
       })
+      
+      // Prevent system overload with controlled delays
+      await new Promise(resolve => setTimeout(resolve, 1000))
     }
-
-    // Close browser
-    await browser.close()
 
     // Mark test run as completed
     const totalTime = Date.now() - startTime
-    await supabaseClient
-      .from('test_runs')
-      .update({
-        status: 'completed',
-        total_tests: testCases.length,
-        passed_tests: passedCount,
-        failed_tests: failedCount,
-        duration_seconds: Math.round(totalTime / 1000),
-        completed_at: new Date().toISOString()
-      })
-      .eq('id', testRunId)
+    
+    try {
+      await supabaseClient
+        .from('test_runs')
+        .update({
+          status: 'completed',
+          total_tests: testCases.length,
+          passed_tests: passedCount,
+          failed_tests: failedCount,
+          duration_seconds: Math.round(totalTime / 1000),
+          completed_at: new Date().toISOString()
+        })
+        .eq('id', testRunId)
+    } catch (updateError) {
+      console.error('Failed to mark test run as completed:', updateError)
+    }
 
     onProgress({
       type: 'complete',
@@ -316,73 +447,180 @@ async function executeRealTests(
     })
 
   } catch (error) {
-    console.error('Error during REAL test execution:', error)
+    console.error('Error during test execution:', error)
     
-    await supabaseClient
-      .from('test_runs')
-      .update({
-        status: 'failed',
-        completed_at: new Date().toISOString()
-      })
-      .eq('id', testRunId)
+    try {
+      await supabaseClient
+        .from('test_runs')
+        .update({
+          status: 'failed',
+          error_message: error.message,
+          completed_at: new Date().toISOString()
+        })
+        .eq('id', testRunId)
+    } catch (updateError) {
+      console.error('Failed to mark test run as failed:', updateError)
+    }
       
     onProgress({
       type: 'error',
       error: error.message || 'Test execution failed'
     })
+    
+  } finally {
+    // Clean up browser session
+    if (browserSession) {
+      try {
+        console.log('Closing browser session...')
+        await browserSession.close()
+        console.log('Browser session closed successfully')
+      } catch (closeError) {
+        console.error('Error closing browser session:', closeError)
+      }
+    }
   }
 }
 
 // Initialize browser instance
 async function initializeBrowser(browserType: string) {
-  // For cloud deployment, use Browserless.io or similar service
-  if (BROWSERLESS_API_KEY) {
-    return await initializeBrowserlessSession(browserType)
+  let lastError;
+  
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      console.log(`Browser connection attempt ${attempt}/3`);
+      const browser = await initializeBrowserlessSession(browserType);
+      console.log('Browser connected successfully');
+      return browser;
+    } catch (error) {
+      lastError = error;
+      console.error(`Attempt ${attempt} failed:`, error);
+      if (attempt < 3) {
+        await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+      }
+    }
   }
   
-  // For local development, would use Playwright directly
-  // Note: This won't work in Supabase Edge Functions without custom container
-  throw new Error('Browser automation requires Browserless API key or custom container deployment')
+  throw new Error(`Failed to connect after 3 attempts: ${lastError?.message}`);
 }
 
 // Initialize Browserless cloud browser session
 async function initializeBrowserlessSession(browserType: string) {
-  const browserlessWsEndpoint = `${BROWSERLESS_URL}?token=${BROWSERLESS_API_KEY}`
+  const BROWSERLESS_API_URL = "https://production-sfo.browserless.io";
   
-  // Create browser via WebSocket connection
-  const response = await fetch('https://chrome.browserless.io/sessions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${BROWSERLESS_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      browser: browserType === 'firefox' ? 'firefox' : 'chrome',
-      timeout: 300000, // 5 minutes
-    })
-  })
+  console.log('Creating Browserless session...');
   
-  if (!response.ok) {
-    throw new Error('Failed to create browser session')
+  try {
+    const response = await fetch(`${BROWSERLESS_API_URL}/browser?token=${BROWSERLESS_API_KEY}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        browser: browserType === 'firefox' ? 'firefox' : 'chrome',
+        headless: true,
+        timeout: 30000,
+        ignoreHTTPSErrors: true
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Browserless API error: ${errorText}`);
+    }
+
+    const session = await response.json();
+    console.log('Browserless session created:', session.id);
+
+    const { chromium } = await import('https://esm.sh/playwright-core@1.40.0');
+    const browser = await chromium.connect({
+      wsEndpoint: session.webSocketDebuggerUrl,
+      timeout: 30000
+    });
+
+    return {
+      type: 'browserless',
+      sessionId: session.id,
+      browser: browser,
+      wsEndpoint: session.webSocketDebuggerUrl,
+      close: async () => {
+        await browser.close();
+        await fetch(`${BROWSERLESS_API_URL}/browser/${session.id}?token=${BROWSERLESS_API_KEY}`, {
+          method: 'DELETE'
+        });
+      }
+    };
+  } catch (error) {
+    console.error('Browserless connection failed:', error);
+    throw error;
   }
-  
-  const session = await response.json()
-  
-  return {
-    sessionId: session.id,
-    wsEndpoint: session.websocketDebuggerUrl,
-    close: async () => {
-      await fetch(`https://chrome.browserless.io/sessions/${session.id}`, {
-        method: 'DELETE',
+}
+
+// Enhanced error handling for browser operations
+async function safeBrowserOperation<T>(
+  operation: () => Promise<T>,
+  fallback: T,
+  operationName: string
+): Promise<T> {
+  try {
+    return await operation()
+  } catch (error) {
+    console.error(`Browser operation failed - ${operationName}:`, error)
+    return fallback
+  }
+}
+
+// Utility function to check if browser session is healthy
+async function checkBrowserHealth(browserSession: any): Promise<boolean> {
+  try {
+    if (browserSession.type === 'browserless') {
+      // Check if WebSocket connection is still alive
+      const response = await fetch(`https://chrome.browserless.io/sessions/${browserSession.sessionId}`, {
         headers: { 'Authorization': `Bearer ${BROWSERLESS_API_KEY}` }
       })
+      return response.ok
+    }
+    
+    // For other browser types, perform basic health check
+    if (browserSession.browser && typeof browserSession.browser.isConnected === 'function') {
+      return browserSession.browser.isConnected()
+    }
+    
+    // If no specific health check method available, assume healthy
+    return true
+    
+  } catch (error) {
+    console.error('Browser health check failed:', error)
+    return false
+  }
+}
+
+// Environment-specific browser configuration
+function getBrowserConfig(environment: string) {
+  const configs = {
+    development: {
+      headless: false,
+      slowMo: 100,
+      timeout: 60000
+    },
+    staging: {
+      headless: true,
+      slowMo: 50,
+      timeout: 30000
+    },
+    production: {
+      headless: true,
+      slowMo: 0,
+      timeout: 15000
     }
   }
+  
+  return configs[environment as keyof typeof configs] || configs.staging
 }
 
 // Execute individual test case with REAL browser interactions
 async function executeIndividualTest(
-  browser: any,
+  browserSession: any,
+  page: any,
   testCase: any,
   environmentUrl: string,
   startTime: number
@@ -392,39 +630,50 @@ async function executeIndividualTest(
   try {
     logs.push(`[${new Date().toISOString()}] Starting test: ${testCase.name}`)
     logs.push(`[${new Date().toISOString()}] Environment: ${environmentUrl}`)
-    logs.push(`[${new Date().toISOString()}] Browser: ${browser.sessionId || 'local'}`)
+    logs.push(`[${new Date().toISOString()}] Browser: ${browserSession.type}`)
 
-    // Create page and navigate
-    const page = await createPageFromSession(browser)
-
-    // Capture initial state
-    const initialDOM = await page.content();
-    const initialConsole: string[] = [];
-    const networkLogs: any[] = [];
+    // Setup page listeners for browsers
+    const consoleLogs: string[] = []
+    const networkLogs: any[] = []
     
-    // Setup listeners
-    page.on('console', msg => initialConsole.push(`[${msg.type()}] ${msg.text()}`));
-    page.on('request', request => networkLogs.push({
-      url: request.url(),
-      method: request.method(),
-      headers: request.headers()
-    }));
+    if (page.on) {
+      page.on('console', (msg: any) => {
+        const logEntry = `[${msg.type()}] ${msg.text()}`
+        consoleLogs.push(logEntry)
+        logs.push(`Browser console: ${logEntry}`)
+      })
 
-    
+      page.on('request', (request: any) => {
+        networkLogs.push({
+          url: request.url(),
+          method: request.method(),
+          timestamp: new Date().toISOString()
+        })
+      })
+    }
+
     logs.push(`[${new Date().toISOString()}] Navigating to ${environmentUrl}`)
-    await page.goto(environmentUrl, { waitUntil: 'networkidle' })
-    
+    await page.goto(environmentUrl, { 
+      waitUntil: 'networkidle', 
+      timeout: 30000 
+    })
+
     // Execute each test step
     for (let stepIndex = 0; stepIndex < testCase.steps.length; stepIndex++) {
       const step = testCase.steps[stepIndex]
       logs.push(`[${new Date().toISOString()}] Step ${stepIndex + 1}: ${step.action}`)
       
-      const stepResult = await executeTestStep(page, step, testCase.test_data)
+      const stepResult = await executeTestStep(page, step, testCase.test_data || {})
       
       if (!stepResult.success) {
-        // Test failed - capture screenshot
-        const screenshotUrl = await captureFailureScreenshot(page, testCase.id, stepIndex)
-        
+        // Test failed - capture screenshot if possible
+        let screenshotUrl = ''
+        try {
+          screenshotUrl = await captureFailureScreenshot(page, testCase.id, stepIndex)
+        } catch (screenshotError) {
+          console.error('Failed to capture screenshot:', screenshotError)
+        }
+
         return {
           test_case_id: testCase.id,
           status: 'fail',
@@ -437,14 +686,18 @@ async function executeIndividualTest(
             expected: step.expected_result,
             actual: stepResult.actual || 'N/A',
             selector: stepResult.selector || 'N/A',
-            page_url: await page.url()
+            page_url: await safeBrowserOperation(
+              () => page.url(),
+              environmentUrl,
+              'get page URL'
+            )
           }
         }
       }
-      
+
       logs.push(`[${new Date().toISOString()}] ✓ Step completed successfully`)
     }
-    
+
     logs.push(`[${new Date().toISOString()}] Test PASSED`)
     
     return {
@@ -453,28 +706,24 @@ async function executeIndividualTest(
       execution_time: Date.now() - startTime,
       logs
     }
-    
+
   } catch (error) {
     logs.push(`[${new Date().toISOString()}] Test FAILED: ${error.message}`)
-     const screenshotUrl = await captureFailureScreenshot(page, testCase.id, stepIndex);
-    const domSnapshot = await page.content();
-    const consoleLogs = await page.evaluate(() => {
-      return window.console.logs || [];
-    });
     
+    let screenshotUrl = ''
+    try {
+      screenshotUrl = await captureFailureScreenshot(page, testCase.id, -1)
+    } catch (screenshotError) {
+      console.error('Failed to capture error screenshot:', screenshotError)
+    }
+
     return {
       test_case_id: testCase.id,
       status: 'fail',
       execution_time: Date.now() - startTime,
       error_message: error.message,
-      logs,
-      failure_details: {
-        dom_snapshot: domSnapshot,
-        console_logs: consoleLogs,
-        network_logs: networkLogs,
-        video_url: await captureTestVideo(page), 
-        performance_metrics: await page.metrics()
-      }
+      screenshot_url: screenshotUrl,
+      logs
     }
   }
 }
@@ -929,33 +1178,57 @@ async function performVerification(page: any, expectedResult: string) {
 }
 
 // Create page from browser session (implementation for Browserless)
-async function createPageFromSession(browser: any) {
-  // For Browserless API, we need to connect via WebSocket
-  if (browser.wsEndpoint) {
-    // Import Playwright for Deno
-    const { chromium } = await import('https://esm.sh/playwright-core@1.40.0')
-    
-    const browserInstance = await chromium.connectOverCDP(browser.wsEndpoint)
-    const context = await browserInstance.newContext({
-      viewport: { width: 1920, height: 1080 },
-      userAgent: 'Mozilla/5.0 (compatible; QA-Autopilot/1.0)'
-    })
-    
-    const page = await context.newPage()
-    
-    // Enhanced page setup for better test execution
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'en-US,en;q=0.9'
-    })
-    
-    // Set default timeouts
-    page.setDefaultTimeout(30000)
-    page.setDefaultNavigationTimeout(30000)
-    
-    return page
-  }
+async function createPageFromSession(browserSession: any) {
+  console.log(`Creating page from ${browserSession.type} session`)
   
-  throw new Error('Browser session not properly initialized')
+  try {
+    if (browserSession.type === 'browserless') {
+      const context = await browserSession.browser.newContext({
+        viewport: { width: 1920, height: 1080 },
+        userAgent: 'Mozilla/5.0 (compatible; QA-Autopilot/1.0)',
+        ignoreHTTPSErrors: true,
+        permissions: ['geolocation', 'notifications']
+      })
+      
+      const page = await context.newPage()
+      
+      // Enhanced page setup
+      await page.setExtraHTTPHeaders({
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br'
+      })
+      
+      // Set timeouts
+      page.setDefaultTimeout(30000)
+      page.setDefaultNavigationTimeout(30000)
+      
+      // Add console logging
+      page.on('console', msg => {
+        console.log(`Browser console [${msg.type()}]:`, msg.text())
+      })
+      
+      // Add error handling
+      page.on('pageerror', error => {
+        console.error('Page error:', error)
+      })
+      
+      return page
+      
+    } else if (browserSession.type === 'puppeteer') {
+      const page = await browserSession.browser.newPage()
+      
+      await page.setViewport({ width: 1920, height: 1080 })
+      await page.setUserAgent('Mozilla/5.0 (compatible; QA-Autopilot/1.0)')
+      
+      return page
+      
+    } 
+    throw new Error(`Unknown browser session type: ${browserSession.type}`)
+    
+  } catch (error) {
+    console.error('Failed to create page from session:', error)
+    throw new Error(`Page creation failed: ${error.message}`)
+  }
 }
 
 // Capture screenshot on failure with enhanced details
