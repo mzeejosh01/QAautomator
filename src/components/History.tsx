@@ -24,6 +24,7 @@ import {
   type TestRun,
   type TestResult,
   type TestCase,
+  supabase,
 } from "@/lib/supabase";
 import { toast } from "@/hooks/use-toast";
 
@@ -70,8 +71,37 @@ const History = () => {
   const loadTestRuns = async () => {
     try {
       setIsLoading(true);
-      const data = await api.getTestRuns(currentProject?.id);
-      setTestRuns(data);
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user) throw new Error("User must be authenticated");
+
+      let query = supabase
+        .from("test_runs")
+        .select("*")
+        .order("created_at", { ascending: false });
+
+      if (currentProject) {
+        query = query.eq("project_id", currentProject.id);
+      } else {
+        // Only show test runs from projects owned by the user
+        const { data: projects } = await supabase
+          .from("projects")
+          .select("id")
+          .eq("owner_id", user.id);
+
+        if (projects && projects.length > 0) {
+          query = query.in(
+            "project_id",
+            projects.map((p) => p.id)
+          );
+        } else {
+          return []; // No projects owned by user
+        }
+      }
+
+      const { data } = await query;
+      setTestRuns(data || []);
     } catch (error: any) {
       toast({
         title: "Error",

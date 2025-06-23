@@ -179,7 +179,29 @@ serve(async (req) => {
             }
           )
         }
-        prompt = `Generate comprehensive test cases for the following feature description:\n\n${sourceData.description}`
+        prompt = `Generate comprehensive test cases for the following feature description:
+
+${sourceData.description}
+
+Generate test cases that:
+1. Cover happy path scenarios
+2. Include edge cases and error conditions
+3. Verify the main functionality described
+4. Consider different user interactions
+5. Include both positive and negative test scenarios
+
+Return ONLY a JSON array of test cases with this exact structure:
+[
+  {
+    "test_name": "DescriptiveTestName",
+    "steps": [
+      {"action": "Step description", "expected_result": "Expected outcome"}
+    ],
+    "test_data": {"key": "value"},
+    "priority": "High|Medium|Low",
+    "category": "UI|API|Integration|etc"
+  }
+]`
         break
       
       case 'github_pr': {
@@ -194,7 +216,34 @@ serve(async (req) => {
         }
         try {
           const prData = await fetchGitHubPR(sourceData.prUrl, project.github_token)
-          prompt = `Generate test cases for this GitHub Pull Request:\n\nTitle: ${prData.title}\n\nDescription: ${prData.body}\n\nChanged Files: ${prData.files.map(f => f.filename).join(', ')}`
+          prompt = `Analyze this GitHub Pull Request and generate comprehensive test cases:
+
+PR Title: ${prData.title}
+PR Description: ${prData.body || 'No description provided'}
+Changed Files: ${prData.files.map(f => f.filename).join(', ')}
+
+Key Changes:
+${prData.files.map(f => `- ${f.filename} (${f.status}): ${f.patch || 'No diff available'}`).join('\n')}
+
+Generate test cases that:
+1. Specifically target the changed functionality
+2. Include both happy path and edge cases for new features
+3. Verify bug fixes if mentioned in the PR
+4. Cover any modified UI components
+5. Include API tests if backend changes are detected
+
+Return ONLY a JSON array of test cases with this exact structure:
+[
+  {
+    "test_name": "DescriptiveTestName",
+    "steps": [
+      {"action": "Step description", "expected_result": "Expected outcome"}
+    ],
+    "test_data": {"key": "value"},
+    "priority": "High|Medium|Low",
+    "category": "UI|API|Integration|etc"
+  }
+]`
         } catch (prError) {
           console.error('Failed to fetch GitHub PR:', prError)
           return new Response(
@@ -218,7 +267,29 @@ serve(async (req) => {
             }
           )
         }
-        prompt = `Generate test cases based on this repository structure analysis:\n\n${JSON.stringify(sourceData.repositoryStructure, null, 2)}`
+        prompt = `Generate test cases based on this repository structure analysis:
+
+${JSON.stringify(sourceData.repositoryStructure, null, 2)}
+
+Generate test cases that:
+1. Cover the main application functionality
+2. Test key API endpoints if detected
+3. Verify UI components and user flows
+4. Include integration tests for connected services
+5. Consider the technology stack and architecture
+
+Return ONLY a JSON array of test cases with this exact structure:
+[
+  {
+    "test_name": "DescriptiveTestName",
+    "steps": [
+      {"action": "Step description", "expected_result": "Expected outcome"}
+    ],
+    "test_data": {"key": "value"},
+    "priority": "High|Medium|Low",
+    "category": "UI|API|Integration|etc"
+  }
+]`
         break
 
       default:
@@ -231,44 +302,6 @@ serve(async (req) => {
         )
     }
 
-    // Enhanced prompt for better test generation
-    const fullPrompt = `
-${prompt}
-
-IMPORTANT: You must return ONLY a valid JSON array. Do not include any explanations, markdown formatting, or text before/after the JSON.
-
-Generate detailed test cases in JSON format. Each test case should include:
-- test_name: A descriptive name for the test
-- steps: Array of objects with 'action' and 'expected_result'
-- test_data: Object with test data needed (usernames, emails, etc.)
-- priority: 'Low', 'Medium', or 'High'
-- category: The type of testing (e.g., 'Authentication', 'UI', 'API', 'Integration')
-
-Focus on:
-1. Happy path scenarios
-2. Edge cases and error handling
-3. Boundary value testing
-4. User experience flows
-5. Security considerations
-
-Return ONLY the JSON array with no additional text:
-
-[
-  {
-    "test_name": "User_Login_Valid_Credentials",
-    "steps": [
-      {"action": "Navigate to login page", "expected_result": "Login form is displayed"},
-      {"action": "Enter valid email", "expected_result": "Email field accepts input"},
-      {"action": "Enter valid password", "expected_result": "Password field accepts input"},
-      {"action": "Click login button", "expected_result": "User is redirected to dashboard"}
-    ],
-    "test_data": {"email": "test@example.com", "password": "ValidPass123!"},
-    "priority": "High",
-    "category": "Authentication"
-  }
-]
-`
-
     // Generate test cases using OpenAI
     console.log('Generating test cases with OpenAI (gpt-4o-mini)...')
     const completion = await openai.chat.completions.create({
@@ -280,7 +313,7 @@ Return ONLY the JSON array with no additional text:
         },
         {
           role: 'user',
-          content: fullPrompt
+          content: prompt
         }
       ],
       temperature: 0.3,
@@ -474,9 +507,35 @@ async function fetchGitHubPR(prUrl: string, githubToken: string) {
 
   const files = await filesResponse.json()
 
+  // Get file contents for changed files
+  const filesWithContent = await Promise.all(
+    files.map(async (file: any) => {
+      if (file.status === 'modified' || file.status === 'added') {
+        try {
+          const contentResponse = await fetch(file.contents_url, {
+            headers: {
+              'Authorization': `token ${githubToken}`,
+              'Accept': 'application/vnd.github.v3.raw',
+            },
+          })
+          if (contentResponse.ok) {
+            const content = await contentResponse.text()
+            return { ...file, content }
+          }
+        } catch (error) {
+          console.warn(`Failed to fetch content for ${file.filename}:`, error)
+        }
+      }
+      return file
+    })
+  )
+
   return {
     title: prData.title,
     body: prData.body || '',
-    files: files,
+    files: filesWithContent,
+    changedLines: files.reduce((acc: number, file: any) => acc + file.changes, 0),
+    additions: prData.additions,
+    deletions: prData.deletions
   }
 }

@@ -128,15 +128,19 @@ export const auth = {
 // API helpers
 export const api = {
   // Projects
-  getProjects: async () => {
-    const { data, error } = await supabase
-      .from('projects')
-      .select('*')
-      .order('created_at', { ascending: false })
-    
-    if (error) throw error
-    return data
-  },
+ getProjects: async () => {
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) throw new Error('User must be authenticated');
+  
+  const { data, error } = await supabase
+    .from('projects')
+    .select('*')
+    .eq('owner_id', user.id) 
+    .order('created_at', { ascending: false });
+  
+  if (error) throw error;
+  return data;
+},
 
   createProject: async (project: Partial<Project>) => {
     // Get current user to set as owner

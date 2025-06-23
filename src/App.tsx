@@ -1,5 +1,11 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import React, { createContext, useContext, useEffect, useState, useRef } from "react";
+import React, {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  useRef,
+} from "react";
 import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -41,7 +47,7 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [isLoading, setIsLoading] = useState(false);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [isInitialized, setIsInitialized] = useState(false);
-  
+
   // Use refs to track loading states and prevent race conditions
   const isLoadingRef = useRef(false);
   const hasLoadedUserDataRef = useRef(false);
@@ -94,7 +100,10 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
       if (event === "SIGNED_IN") {
         setUser(session?.user || null);
         // Only load data if we haven't loaded it yet or if this is a new user
-        if (!hasLoadedUserDataRef.current || (session?.user && session.user.id !== user?.id)) {
+        if (
+          !hasLoadedUserDataRef.current ||
+          (session?.user && session.user.id !== user?.id)
+        ) {
           await loadUserData();
         }
       } else if (event === "SIGNED_OUT") {
@@ -130,7 +139,7 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
 
       // Load projects
       await refreshProjects();
-      
+
       hasLoadedUserDataRef.current = true;
     } catch (error) {
       console.error("Failed to load user data:", error);
@@ -166,14 +175,19 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // Handle visibility change to prevent unnecessary reloads
   useEffect(() => {
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible' && user && !hasLoadedUserDataRef.current) {
+      if (
+        document.visibilityState === "visible" &&
+        user &&
+        !hasLoadedUserDataRef.current
+      ) {
         // Only reload if we haven't loaded data yet
         loadUserData();
       }
     };
 
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () =>
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
   }, [user]);
 
   const value: AppContextType = {
