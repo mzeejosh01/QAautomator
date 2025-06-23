@@ -396,6 +396,20 @@ async function executeIndividualTest(
 
     // Create page and navigate
     const page = await createPageFromSession(browser)
+
+    // Capture initial state
+    const initialDOM = await page.content();
+    const initialConsole: string[] = [];
+    const networkLogs: any[] = [];
+    
+    // Setup listeners
+    page.on('console', msg => initialConsole.push(`[${msg.type()}] ${msg.text()}`));
+    page.on('request', request => networkLogs.push({
+      url: request.url(),
+      method: request.method(),
+      headers: request.headers()
+    }));
+
     
     logs.push(`[${new Date().toISOString()}] Navigating to ${environmentUrl}`)
     await page.goto(environmentUrl, { waitUntil: 'networkidle' })
@@ -442,13 +456,25 @@ async function executeIndividualTest(
     
   } catch (error) {
     logs.push(`[${new Date().toISOString()}] Test FAILED: ${error.message}`)
+     const screenshotUrl = await captureFailureScreenshot(page, testCase.id, stepIndex);
+    const domSnapshot = await page.content();
+    const consoleLogs = await page.evaluate(() => {
+      return window.console.logs || [];
+    });
     
     return {
       test_case_id: testCase.id,
       status: 'fail',
       execution_time: Date.now() - startTime,
       error_message: error.message,
-      logs
+      logs,
+      failure_details: {
+        dom_snapshot: domSnapshot,
+        console_logs: consoleLogs,
+        network_logs: networkLogs,
+        video_url: await captureTestVideo(page), 
+        performance_metrics: await page.metrics()
+      }
     }
   }
 }
