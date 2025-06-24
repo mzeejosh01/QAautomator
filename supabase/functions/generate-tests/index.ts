@@ -34,6 +34,43 @@ interface GenerateTestsRequest {
   };
 }
 
+// Define valid action patterns for LambdaTest
+const VALID_ACTION_PATTERNS = {
+  navigate: /^navigate to\s+/i,
+  click: /^click\s+/i,
+  type: /^(type|enter)\s+.+\s+in\s+/i,
+};
+
+const ACTION_FORMAT_GUIDE = `
+IMPORTANT: Use ONLY these specific action formats that LambdaTest can understand:
+
+1. NAVIGATION: "navigate to [url or path]"
+   Examples:
+   - "navigate to /login"
+   - "navigate to https://example.com"
+   - "navigate to /dashboard"
+
+2. CLICKING: "click [element description]"
+   Examples:
+   - "click login button"
+   - "click submit button"
+   - "click cancel link"
+   - "click menu icon"
+
+3. TEXT INPUT: "type [value] in [field name]" OR "enter [value] in [field name]"
+   Examples:
+   - "type test@example.com in email field"
+   - "enter password123 in password field"
+   - "type John Doe in name input"
+   - "enter Hello World in message textarea"
+
+DO NOT USE complex actions like:
+- "fill in the form" (break it down to individual field entries)
+- "complete the registration" (break it down to specific clicks and types)
+- "verify the page" (use specific expected results instead)
+- "wait for page to load" (this is handled automatically)
+`;
+
 serve(async (req) => {
   console.log(`${req.method} ${req.url}`)
   
@@ -183,6 +220,8 @@ serve(async (req) => {
 
 ${sourceData.description}
 
+${ACTION_FORMAT_GUIDE}
+
 Generate test cases that:
 1. Cover happy path scenarios
 2. Include edge cases and error conditions
@@ -190,18 +229,23 @@ Generate test cases that:
 4. Consider different user interactions
 5. Include both positive and negative test scenarios
 
-Return ONLY a JSON array of test cases with this exact structure:
-[
-  {
-    "test_name": "DescriptiveTestName",
-    "steps": [
-      {"action": "Step description", "expected_result": "Expected outcome"}
-    ],
-    "test_data": {"key": "value"},
-    "priority": "High|Medium|Low",
-    "category": "UI|API|Integration|etc"
-  }
-]`
+EXAMPLE of a properly formatted test case:
+{
+  "test_name": "Verify contact form submission with valid data",
+  "steps": [
+    {"action": "navigate to /contact", "expected_result": "Contact page is displayed"},
+    {"action": "type John Doe in name field", "expected_result": "Name field contains John Doe"},
+    {"action": "type john@example.com in email field", "expected_result": "Email field contains john@example.com"},
+    {"action": "type Hello, this is a test message in message field", "expected_result": "Message field contains the text"},
+    {"action": "click submit button", "expected_result": "Form is submitted successfully"},
+    {"action": "navigate to /thank-you", "expected_result": "Thank you page is displayed"}
+  ],
+  "test_data": {"name": "John Doe", "email": "john@example.com", "message": "Hello, this is a test message"},
+  "priority": "High",
+  "category": "UI"
+}
+
+Return ONLY a JSON array of test cases with the exact structure shown above. Each action MUST follow the format guide.`
         break
       
       case 'github_pr': {
@@ -225,6 +269,8 @@ Changed Files: ${prData.files.map(f => f.filename).join(', ')}
 Key Changes:
 ${prData.files.map(f => `- ${f.filename} (${f.status}): ${f.patch || 'No diff available'}`).join('\n')}
 
+${ACTION_FORMAT_GUIDE}
+
 Generate test cases that:
 1. Specifically target the changed functionality
 2. Include both happy path and edge cases for new features
@@ -232,18 +278,11 @@ Generate test cases that:
 4. Cover any modified UI components
 5. Include API tests if backend changes are detected
 
-Return ONLY a JSON array of test cases with this exact structure:
-[
-  {
-    "test_name": "DescriptiveTestName",
-    "steps": [
-      {"action": "Step description", "expected_result": "Expected outcome"}
-    ],
-    "test_data": {"key": "value"},
-    "priority": "High|Medium|Low",
-    "category": "UI|API|Integration|etc"
-  }
-]`
+Break down complex workflows into simple actions. For example:
+- Instead of "complete user registration flow"
+- Use: "navigate to /register", "type email in email field", "type password in password field", "click register button"
+
+Return ONLY a JSON array of test cases. Each action MUST use only: navigate to, click, type/enter in.`
         } catch (prError) {
           console.error('Failed to fetch GitHub PR:', prError)
           return new Response(
@@ -271,25 +310,21 @@ Return ONLY a JSON array of test cases with this exact structure:
 
 ${JSON.stringify(sourceData.repositoryStructure, null, 2)}
 
+${ACTION_FORMAT_GUIDE}
+
 Generate test cases that:
 1. Cover the main application functionality
-2. Test key API endpoints if detected
-3. Verify UI components and user flows
-4. Include integration tests for connected services
-5. Consider the technology stack and architecture
+2. Test key UI interactions
+3. Verify user flows step by step
+4. Include form validations and error handling
+5. Test navigation between pages
 
-Return ONLY a JSON array of test cases with this exact structure:
-[
-  {
-    "test_name": "DescriptiveTestName",
-    "steps": [
-      {"action": "Step description", "expected_result": "Expected outcome"}
-    ],
-    "test_data": {"key": "value"},
-    "priority": "High|Medium|Low",
-    "category": "UI|API|Integration|etc"
-  }
-]`
+Remember to break down ALL complex actions into simple steps using ONLY:
+- "navigate to [path]" for page navigation
+- "click [element]" for all clicks
+- "type [value] in [field]" or "enter [value] in [field]" for text input
+
+Return ONLY a JSON array of test cases with properly formatted actions.`
         break
 
       default:
@@ -309,7 +344,14 @@ Return ONLY a JSON array of test cases with this exact structure:
       messages: [
         {
           role: 'system',
-          content: 'You are an expert QA engineer. Generate comprehensive, practical test cases in the exact JSON format requested. Be thorough and consider real-world testing scenarios.'
+          content: `You are an expert QA engineer who MUST generate test cases using ONLY these exact action formats:
+1. "navigate to [url/path]" - for navigation
+2. "click [element]" - for clicking
+3. "type [value] in [field]" OR "enter [value] in [field]" - for text input
+
+NEVER use any other action format. Break down complex actions into these simple steps.
+Always be specific about element names (e.g., "login button", "email field", "submit button").
+Generate practical, executable test cases in valid JSON format.`
         },
         {
           role: 'user',
@@ -381,15 +423,21 @@ Return ONLY a JSON array of test cases with this exact structure:
       console.log('Creating fallback test cases...')
       testCases = [
         {
-          test_name: "Generated_Test_Case",
+          test_name: "Basic Application Test",
           steps: [
-            { action: "Navigate to the application", expected_result: "Application loads successfully" },
-            { action: "Perform the main functionality", expected_result: "Feature works as expected" },
-            { action: "Verify the outcome", expected_result: "Expected results are achieved" }
+            { action: "navigate to /", expected_result: "Application loads successfully" },
+            { action: "click login button", expected_result: "Login page is displayed" },
+            { action: "type test@example.com in email field", expected_result: "Email is entered" },
+            { action: "type password123 in password field", expected_result: "Password is entered" },
+            { action: "click submit button", expected_result: "Login is attempted" }
           ],
-          test_data: { "note": "Auto-generated due to parsing error" },
+          test_data: { 
+            "email": "test@example.com",
+            "password": "password123",
+            "note": "Auto-generated due to parsing error" 
+          },
           priority: "Medium" as const,
-          category: "General Testing"
+          category: "UI"
         }
       ]
       
@@ -397,7 +445,69 @@ Return ONLY a JSON array of test cases with this exact structure:
       console.warn('Using fallback test case due to parsing error')
     }
 
-    console.log(`Generated ${testCases.length} test cases`)
+    // Validate and fix action formats
+    console.log('Validating action formats...')
+    testCases = testCases.map((tc, tcIndex) => {
+      const validatedSteps = tc.steps.map((step, stepIndex) => {
+        const action = step.action.trim();
+        const actionLower = action.toLowerCase();
+        
+        // Check if action matches valid patterns
+        const isValidNavigate = VALID_ACTION_PATTERNS.navigate.test(action);
+        const isValidClick = VALID_ACTION_PATTERNS.click.test(action);
+        const isValidType = VALID_ACTION_PATTERNS.type.test(action);
+        
+        if (!isValidNavigate && !isValidClick && !isValidType) {
+          console.warn(`Test case ${tcIndex}, step ${stepIndex} has invalid action format: ${action}`);
+          
+          // Try to auto-fix common patterns
+          let fixedAction = action;
+          
+          // Fix navigation patterns
+          if (actionLower.includes('go to') || actionLower.includes('open') || actionLower.includes('visit')) {
+            fixedAction = action.replace(/go to|open|visit/gi, 'navigate to');
+          }
+          // Fix click patterns
+          else if (actionLower.includes('press') || actionLower.includes('tap') || actionLower.includes('select')) {
+            fixedAction = action.replace(/press|tap|select/gi, 'click');
+          }
+          // Fix input patterns
+          else if (actionLower.includes('input') || actionLower.includes('fill') || actionLower.includes('write')) {
+            // Try to extract field and value
+            const fieldMatch = action.match(/(?:in|into|to)\s+(\w+)/i);
+            const valueMatch = action.match(/"([^"]+)"|'([^']+)'|(\S+)/);
+            
+            if (fieldMatch && valueMatch) {
+              const field = fieldMatch[1];
+              const value = valueMatch[1] || valueMatch[2] || valueMatch[3];
+              fixedAction = `type ${value} in ${field} field`;
+            } else {
+              fixedAction = `type value in field`; // Generic fallback
+            }
+          }
+          // If still doesn't match, try to categorize
+          else if (actionLower.includes('button') || actionLower.includes('link')) {
+            fixedAction = `click ${action}`;
+          }
+          else if (actionLower.includes('field') || actionLower.includes('input')) {
+            fixedAction = `type text in ${action}`;
+          }
+          else {
+            // Last resort - assume it's a click action
+            fixedAction = `click ${action}`;
+          }
+          
+          console.log(`Auto-fixed action: "${action}" -> "${fixedAction}"`);
+          return { ...step, action: fixedAction };
+        }
+        
+        return step;
+      });
+      
+      return { ...tc, steps: validatedSteps };
+    });
+
+    console.log(`Generated and validated ${testCases.length} test cases`)
 
     // Store AI generation record
     const { error: aiRecordError } = await supabaseClient
