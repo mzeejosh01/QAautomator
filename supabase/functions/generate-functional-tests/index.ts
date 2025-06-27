@@ -1,48 +1,17 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-// supabase/functions/generate-tests/index.ts
+// supabase/functions/generate-functional-tests/index.ts
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts"
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 import OpenAI from 'https://esm.sh/openai@4'
 
-// CORS configuration - More permissive for development
+// CORS configuration
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-requested-with, accept, accept-language, cache-control, pragma',
   'Access-Control-Allow-Methods': 'POST, GET, OPTIONS, PUT, DELETE, PATCH',
   'Access-Control-Max-Age': '86400',
-  'Access-Control-Allow-Credentials': 'false', // Explicitly set to false when using *
-}
-
-interface TestCase {
-  test_name: string;
-  steps: Array<{
-    action: string;
-    expected_result: string;
-  }>;
-  test_data: Record<string, string>;
-  priority: 'Low' | 'Medium' | 'High';
-  category: string;
-}
-
-interface GenerateTestsRequest {
-  projectId: string;
-  sourceType: 'description' | 'github_pr' | 'repository_analysis' | 'load_test';
-  sourceData: {
-    description?: string;
-    prUrl?: string;
-    repositoryStructure?: any;
-    config?: {
-      threads?: number;
-      ramp_up?: number;
-      duration?: number;
-      endpoints?: Array<{
-        url: string;
-        method: 'GET' | 'POST' | 'PUT' | 'DELETE';
-        body?: string;
-      }>;
-    };
-  };
+  'Access-Control-Allow-Credentials': 'false',
 }
 
 interface FunctionalTestCase {
@@ -57,25 +26,17 @@ interface FunctionalTestCase {
   test_type: 'functional';
 }
 
-interface LoadTestConfig {
-  test_name: string;
-  description: string;
-  test_type: 'load';
-  jmeter_config: {
-    threads: number;
-    ramp_up: number;
-    duration: number;
-    target_tps?: number;
-    endpoints: Array<{
-      url: string;
-      method: 'GET' | 'POST' | 'PUT' | 'DELETE';
-      body?: string;
-      headers?: Record<string, string>;
-    }>;
+interface GenerateFunctionalTestsRequest {
+  projectId: string;
+  sourceType: 'description' | 'github_pr' | 'repository_analysis';
+  sourceData: {
+    description?: string;
+    prUrl?: string;
+    repositoryStructure?: any;
   };
 }
 
-// Define valid action patterns for LambdaTest
+// Define valid action patterns for LambdaTest/Selenium
 const VALID_ACTION_PATTERNS = {
   navigate: /^navigate to\s+(?:https?:\/\/)?[^\s]+/i,
   click: /^click\s+(?:the\s+)?[\w\s]+(?: button| link| icon| element)?$/i,
@@ -83,7 +44,7 @@ const VALID_ACTION_PATTERNS = {
 };
 
 const ACTION_FORMAT_GUIDE = `
-IMPORTANT: Use ONLY these specific action formats that LambdaTest can understand:
+IMPORTANT: Use ONLY these specific action formats that LambdaTest/Selenium can understand:
 
 1. NAVIGATION: "navigate to [url or path]"
    Examples:
@@ -112,71 +73,14 @@ DO NOT USE complex actions like:
 - "wait for page to load" (this is handled automatically)
 `;
 
-const LOAD_TEST_PROMPT = `
-You are an expert performance engineer. Generate a comprehensive JMeter load test configuration with these requirements:
-
-Test Configuration:
-- Threads: {threads} virtual users
-- Ramp-up: {ramp_up} seconds
-- Duration: {duration} seconds
-- Target Throughput: {target_tps} requests/second
-
-API Endpoints to Test:
-{endpoints}
-
-Additional Requirements:
-{description}
-
-Generate a complete JMeter test plan configuration with:
-1. Thread Group with specified load parameters
-2. HTTP Request samplers for each endpoint
-3. Proper timers between requests (300-1000ms)
-4. Response assertions to verify success
-5. JSON/XML extractors if responses contain dynamic data
-6. CSV Data Config if test data is needed
-7. Listeners for results collection
-
-Return ONLY a JSON object with this exact structure:
-{
-  "test_name": "Load Test - [purpose]",
-  "description": "Detailed description...",
-  "test_type": "load",
-  "jmeter_config": {
-    "threads": number,
-    "ramp_up": number,
-    "duration": number,
-    "target_tps": number,
-    "endpoints": [
-      {
-        "url": "string",
-        "method": "GET|POST|PUT|DELETE",
-        "body": "string (if POST/PUT)",
-        "headers": {
-          "Content-Type": "application/json"
-        },
-        "assertions": [
-          {
-            "field": "response_code|response_data|etc",
-            "pattern": "200|success|etc"
-          }
-        ]
-      }
-    ],
-    "timers": {
-      "constant_delay": 500,
-      "random_delay": 200
-    }
-  }
-}`;
-
 // Helper functions
-function validateTestCases(testCases: any[]): TestCase[] {
+function validateTestCases(testCases: any[]): FunctionalTestCase[] {
   return testCases.map(tc => {
     // Ensure required fields exist
     if (!tc.test_name) tc.test_name = `Test Case ${Math.random().toString(36).substring(7)}`;
     if (!tc.steps || !Array.isArray(tc.steps)) tc.steps = [];
     if (!tc.priority) tc.priority = 'Medium';
-    if (!tc.category) tc.category = 'General';
+    if (!tc.category) tc.category = 'UI';
     if (!tc.test_data) tc.test_data = {};
     
     // Validate and fix steps
@@ -194,7 +98,10 @@ function validateTestCases(testCases: any[]): TestCase[] {
       };
     });
     
-    return tc as TestCase;
+    return {
+      ...tc,
+      test_type: 'functional'
+    } as FunctionalTestCase;
   });
 }
 
@@ -310,16 +217,16 @@ async function fetchGitHubPR(prUrl: string, githubToken: string) {
 serve(async (req) => {
   console.log(`${req.method} ${req.url}`)
   
-  // Handle CORS preflight requests FIRST - This is the critical fix
+  // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
     console.log('Handling CORS preflight request')
     return new Response(null, { 
-      status: 200, // Ensure this is 200, not 204
+      status: 200,
       headers: corsHeaders 
     })
   }
 
-  // Only allow POST requests for the main functionality
+  // Only allow POST requests
   if (req.method !== 'POST') {
     console.log('Method not allowed:', req.method)
     return new Response(
@@ -332,7 +239,7 @@ serve(async (req) => {
   }
 
   try {
-    console.log('Processing POST request...')
+    console.log('Processing functional test generation request...')
     
     // Validate environment variables
     const supabaseUrl = Deno.env.get('SUPABASE_URL')
@@ -386,7 +293,7 @@ serve(async (req) => {
     console.log('User authenticated:', user.id)
 
     // Parse request body
-    let requestData: GenerateTestsRequest
+    let requestData: GenerateFunctionalTestsRequest
     try {
       requestData = await req.json()
     } catch (parseError) {
@@ -439,107 +346,6 @@ serve(async (req) => {
       apiKey: openaiApiKey,
     })
 
-    // Handle load test generation separately
-    if (sourceType === 'load_test') {
-      console.log('Generating load test configuration...');
-      
-      const defaultConfig = {
-        threads: 10,
-        ramp_up: 30,
-        duration: 300, // 5 minutes
-        endpoints: sourceData.config?.endpoints || [{
-          url: '',
-          method: 'GET' as const,
-          body: '',
-        }],
-        ...sourceData.config,
-      };
-
-      const prompt = LOAD_TEST_PROMPT
-        .replace('{threads}', defaultConfig.threads.toString())
-        .replace('{ramp_up}', defaultConfig.ramp_up.toString())
-        .replace('{duration}', defaultConfig.duration.toString())
-        .replace('{target_tps}', defaultConfig.target_tps?.toString() || 'not specified')
-        .replace('{endpoints}', JSON.stringify(defaultConfig.endpoints, null, 2))
-        .replace('{description}', sourceData.description || 'General API load test');
-
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a performance testing expert specializing in JMeter test plans. ' +
-        'Return ONLY valid JSON configuration matching the exact required structure. ' +
-        'Include all necessary JMeter components for a complete load test.'
-          },
-          {
-            role: 'user',
-            content: prompt
-          }
-        ],
-        temperature: 0.1, // Lower temperature for more precise configurations
-        max_tokens: 3000,
-         response_format: { type: "json_object" },
-      });
-
-      const generatedContent = completion.choices[0]?.message?.content;
-      if (!generatedContent) {
-        throw new Error('Failed to generate load test configuration');
-      }
-
-      let loadTestConfig: LoadTestConfig;
-      try {
-        loadTestConfig = JSON.parse(generatedContent);
-        
-        // Validate the structure
-        if (!loadTestConfig.jmeter_config || !loadTestConfig.jmeter_config.endpoints) {
-          throw new Error('Invalid load test configuration structure');
-        }
-      } catch (parseError) {
-        console.error('Failed to parse load test config:', parseError);
-        // Fallback to default config
-        loadTestConfig = {
-          test_name: `Load Test - ${new Date().toISOString()}`,
-          description: sourceData.description || 'Generated API load test',
-          test_type: 'load',
-          jmeter_config: defaultConfig,
-        };
-      }
-
-      // Store the load test configuration
-      const { data: insertedTestCase, error: insertError } = await supabaseClient
-        .from('test_cases')
-        .insert({
-          project_id: projectId,
-          name: loadTestConfig.test_name,
-          description: loadTestConfig.description,
-          test_type: 'load',
-          jmeter_config: loadTestConfig.jmeter_config,
-          priority: 'High',
-          category: 'Performance',
-          created_by: user.id,
-        })
-        .select()
-        .single();
-
-      if (insertError) {
-        throw new Error(`Failed to save load test: ${insertError.message}`);
-      }
-
-      return new Response(
-        JSON.stringify({
-          success: true,
-          testCase: insertedTestCase,
-          generatedCount: 1,
-        }),
-        {
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-          status: 200,
-        }
-      );
-    }
-
-    // Handle functional test generation
     let prompt = ''
 
     // Build prompt based on source type
@@ -554,36 +360,36 @@ serve(async (req) => {
             }
           )
         }
-        prompt = `Generate comprehensive test cases for the following feature description:
+        prompt = `Generate comprehensive functional test cases for Selenium/LambdaTest execution based on this feature description:
 
 ${sourceData.description}
 
 ${ACTION_FORMAT_GUIDE}
 
 Generate test cases that:
-1. Cover happy path scenarios
+1. Cover happy path scenarios for UI interactions
 2. Include edge cases and error conditions
-3. Verify the main functionality described
-4. Consider different user interactions
+3. Verify form validations and user inputs
+4. Test navigation flows between pages
 5. Include both positive and negative test scenarios
+6. Focus on user-facing functionality that can be automated with Selenium
 
-EXAMPLE of a properly formatted test case:
+EXAMPLE of a properly formatted functional test case:
 {
-  "test_name": "Verify contact form submission with valid data",
+  "test_name": "Verify user login with valid credentials",
   "steps": [
-    {"action": "navigate to /contact", "expected_result": "Contact page is displayed"},
-    {"action": "type John Doe in name field", "expected_result": "Name field contains John Doe"},
+    {"action": "navigate to /login", "expected_result": "Login page is displayed"},
     {"action": "type john@example.com in email field", "expected_result": "Email field contains john@example.com"},
-    {"action": "type Hello, this is a test message in message field", "expected_result": "Message field contains the text"},
-    {"action": "click submit button", "expected_result": "Form is submitted successfully"},
-    {"action": "navigate to /thank-you", "expected_result": "Thank you page is displayed"}
+    {"action": "type password123 in password field", "expected_result": "Password field is filled"},
+    {"action": "click login button", "expected_result": "User is redirected to dashboard"},
+    {"action": "navigate to /dashboard", "expected_result": "Dashboard page loads with user data"}
   ],
-  "test_data": {"name": "John Doe", "email": "john@example.com", "message": "Hello, this is a test message"},
+  "test_data": {"email": "john@example.com", "password": "password123"},
   "priority": "High",
-  "category": "UI"
+  "category": "Authentication"
 }
 
-Return ONLY a JSON array of test cases with the exact structure shown above. Each action MUST follow the format guide.`
+Return ONLY a JSON array of functional test cases. Each action MUST follow the format guide exactly.`
         break
       
       case 'github_pr': {
@@ -598,7 +404,7 @@ Return ONLY a JSON array of test cases with the exact structure shown above. Eac
         }
         try {
           const prData = await fetchGitHubPR(sourceData.prUrl, project.github_token)
-          prompt = `Analyze this GitHub Pull Request and generate comprehensive test cases:
+          prompt = `Generate functional test cases for Selenium/LambdaTest based on this GitHub Pull Request:
 
 PR Title: ${prData.title}
 PR Description: ${prData.body || 'No description provided'}
@@ -609,18 +415,17 @@ ${prData.files.map(f => `- ${f.filename} (${f.status}): ${f.patch || 'No diff av
 
 ${ACTION_FORMAT_GUIDE}
 
-Generate test cases that:
-1. Specifically target the changed functionality
-2. Include both happy path and edge cases for new features
-3. Verify bug fixes if mentioned in the PR
-4. Cover any modified UI components
-5. Include API tests if backend changes are detected
+Generate functional test cases that:
+1. Target UI changes and new user-facing features
+2. Test form interactions and validations
+3. Verify navigation changes
+4. Cover both happy path and error scenarios for new functionality
+5. Focus on features that can be automated with Selenium WebDriver
+6. Include regression tests for existing functionality that might be affected
 
-Break down complex workflows into simple actions. For example:
-- Instead of "complete user registration flow"
-- Use: "navigate to /register", "type email in email field", "type password in password field", "click register button"
+Break down complex workflows into simple, testable actions. Focus on what users can see and interact with in the browser.
 
-Return ONLY a JSON array of test cases. Each action MUST use only: navigate to, click, type/enter in.`
+Return ONLY a JSON array of functional test cases. Each action MUST use only: navigate to, click, type/enter in.`
         } catch (prError) {
           console.error('Failed to fetch GitHub PR:', prError)
           return new Response(
@@ -644,30 +449,31 @@ Return ONLY a JSON array of test cases. Each action MUST use only: navigate to, 
             }
           )
         }
-        prompt = `Generate test cases based on this repository structure analysis:
+        prompt = `Generate functional test cases for Selenium/LambdaTest based on this repository structure:
 
 ${JSON.stringify(sourceData.repositoryStructure, null, 2)}
 
 ${ACTION_FORMAT_GUIDE}
 
-Generate test cases that:
-1. Cover the main application functionality
-2. Test key UI interactions
-3. Verify user flows step by step
-4. Include form validations and error handling
-5. Test navigation between pages
+Generate functional test cases that:
+1. Cover main user journeys and workflows
+2. Test key UI components and interactions
+3. Verify form submissions and validations
+4. Test navigation between different sections
+5. Include authentication flows if present
+6. Focus on end-to-end user scenarios
 
-Remember to break down ALL complex actions into simple steps using ONLY:
+Remember to break down ALL complex actions into simple, Selenium-compatible steps using ONLY:
 - "navigate to [path]" for page navigation
-- "click [element]" for all clicks
+- "click [element]" for all clicking actions
 - "type [value] in [field]" or "enter [value] in [field]" for text input
 
-Return ONLY a JSON array of test cases with properly formatted actions.`
+Return ONLY a JSON array of functional test cases with properly formatted actions for automated execution.`
         break
 
       default:
         return new Response(
-          JSON.stringify({ error: 'Invalid source type' }),
+          JSON.stringify({ error: 'Invalid source type. Supported: description, github_pr, repository_analysis' }),
           { 
             status: 400, 
             headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -675,41 +481,42 @@ Return ONLY a JSON array of test cases with properly formatted actions.`
         )
     }
 
-    // Generate test cases using OpenAI
-    console.log('Generating test cases with OpenAI (gpt-4o-mini)...')
+    // Generate functional test cases using OpenAI
+    console.log('Generating functional test cases with OpenAI...')
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',  // Optimal choice: fast, cheap, excellent quality
+      model: 'gpt-4o-mini',
       messages: [
         {
           role: 'system',
-          content: `You are an expert QA engineer who MUST generate test cases using ONLY these exact action formats:
+          content: `You are an expert QA automation engineer specializing in Selenium WebDriver and LambdaTest. 
+You MUST generate functional test cases using ONLY these exact action formats:
 1. "navigate to [url/path]" - for navigation
-2. "click [element]" - for clicking
+2. "click [element]" - for clicking elements
 3. "type [value] in [field]" OR "enter [value] in [field]" - for text input
 
-NEVER use any other action format. Break down complex actions into these simple steps.
+NEVER use any other action format. Break down complex user flows into these simple, automatable steps.
 Always be specific about element names (e.g., "login button", "email field", "submit button").
-Generate practical, executable test cases in valid JSON format.`
+Generate practical, executable test cases that focus on UI interactions and user workflows.
+Return only valid JSON format without code blocks or explanations.`
         },
         {
           role: 'user',
           content: prompt
         }
       ],
-      temperature: 0.3,
+      temperature: 0.2, // Lower temperature for more consistent formatting
       max_tokens: 4000,
     })
 
     const generatedContent = completion.choices[0]?.message?.content
     if (!generatedContent) {
-      throw new Error('Failed to generate test cases')
+      throw new Error('Failed to generate functional test cases')
     }
 
-    console.log('Parsing generated test cases...')
-    console.log('Raw OpenAI response:', generatedContent)
+    console.log('Parsing generated functional test cases...')
     
     // Parse the JSON response with robust error handling
-    let testCases: TestCase[]
+    let testCases: FunctionalTestCase[]
     try {
       let jsonContent = generatedContent.trim()
       
@@ -732,12 +539,10 @@ Generate practical, executable test cases in valid JSON format.`
         jsonContent = arrayMatch[0]
       }
       
-      // Clean up common issues
+      // Clean up common JSON issues
       jsonContent = jsonContent
         .replace(/,\s*\]/g, ']')  // Remove trailing commas
         .replace(/,\s*\}/g, '}')  // Remove trailing commas in objects
-      
-      console.log('Cleaned JSON content:', jsonContent)
       
       testCases = JSON.parse(jsonContent)
       
@@ -751,35 +556,42 @@ Generate practical, executable test cases in valid JSON format.`
       
     } catch (parseError) {
       console.error('Failed to parse OpenAI response:', parseError)
-      console.error('Generated content:', generatedContent)
       
-      // Fallback: create a basic test case from the description
-      console.log('Creating fallback test cases...')
+      // Fallback: create basic functional test cases
+      console.log('Creating fallback functional test cases...')
       testCases = [
         {
-          test_name: "Basic Application Test",
+          test_name: "Basic Navigation Test",
           steps: [
-            { action: "navigate to /", expected_result: "Application loads successfully" },
-            { action: "click login button", expected_result: "Login page is displayed" },
-            { action: "type test@example.com in email field", expected_result: "Email is entered" },
-            { action: "type password123 in password field", expected_result: "Password is entered" },
-            { action: "click submit button", expected_result: "Login is attempted" }
+            { action: "navigate to /", expected_result: "Homepage loads successfully" },
+            { action: "click about link", expected_result: "About page is displayed" }
+          ],
+          test_data: { "note": "Auto-generated fallback test" },
+          priority: "Medium" as const,
+          category: "Navigation",
+          test_type: "functional" as const
+        },
+        {
+          test_name: "Basic Form Interaction Test",
+          steps: [
+            { action: "navigate to /contact", expected_result: "Contact form is displayed" },
+            { action: "type John Doe in name field", expected_result: "Name is entered" },
+            { action: "type john@example.com in email field", expected_result: "Email is entered" },
+            { action: "click submit button", expected_result: "Form submission is attempted" }
           ],
           test_data: { 
-            "email": "test@example.com",
-            "password": "password123",
-            "note": "Auto-generated due to parsing error" 
+            "name": "John Doe",
+            "email": "john@example.com",
+            "note": "Auto-generated fallback test" 
           },
-          priority: "Medium" as const,
-          category: "UI"
+          priority: "High" as const,
+          category: "Forms",
+          test_type: "functional" as const
         }
       ]
-      
-      // Still log the parsing error but don't throw - use fallback instead
-      console.warn('Using fallback test case due to parsing error')
     }
 
-    console.log(`Generated and validated ${testCases.length} test cases`)
+    console.log(`Generated and validated ${testCases.length} functional test cases`)
 
     // Store AI generation record
     const { error: aiRecordError } = await supabaseClient
@@ -800,32 +612,34 @@ Generate practical, executable test cases in valid JSON format.`
     const testCaseInserts = testCases.map(tc => ({
       project_id: projectId,
       name: tc.test_name,
-      description: `Generated from ${sourceType}`,
+      description: `Functional test generated from ${sourceType}`,
       steps: tc.steps,
       test_data: tc.test_data,
+      test_type: 'functional',
       priority: tc.priority,
       category: tc.category,
       created_by: user.id,
     }))
 
-    console.log('Saving test cases to database...')
+    console.log('Saving functional test cases to database...')
     const { data: insertedTestCases, error: insertError } = await supabaseClient
       .from('test_cases')
       .insert(testCaseInserts)
       .select()
 
     if (insertError) {
-      console.error('Failed to insert test cases:', insertError)
-      throw new Error('Failed to save test cases')
+      console.error('Failed to insert functional test cases:', insertError)
+      throw new Error('Failed to save functional test cases')
     }
 
-    console.log(`Successfully saved ${insertedTestCases.length} test cases`)
+    console.log(`Successfully saved ${insertedTestCases.length} functional test cases`)
 
     return new Response(
       JSON.stringify({
         success: true,
         testCases: insertedTestCases,
         generatedCount: testCases.length,
+        testType: 'functional'
       }),
       {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -834,7 +648,7 @@ Generate practical, executable test cases in valid JSON format.`
     )
 
   } catch (error) {
-    console.error('Error in generate-tests function:', error)
+    console.error('Error in generate-functional-tests function:', error)
     return new Response(
       JSON.stringify({
         error: error.message || 'Internal server error',

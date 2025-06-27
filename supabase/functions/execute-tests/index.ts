@@ -11,12 +11,12 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'POST, GET, OPTIONS, PUT, DELETE',
   'Access-Control-Max-Age': '86400',
 }
-
 interface ExecuteTestsRequest {
   projectId: string;
   testCaseIds: string[];
   browserType?: 'chrome' | 'firefox' | 'safari';
   environment?: 'local' | 'staging' | 'production';
+  testType?: 'functional' | 'load';
 }
 
 interface TestResult {
@@ -32,6 +32,23 @@ interface TestResult {
     actual: string;
     selector: string;
     page_url: string;
+  };
+  load_test_metrics?: {
+    requests_per_second?: number;
+    avg_response_time?: number;
+    error_rate?: number;
+    throughput?: number;
+    percentile_90?: number;
+    percentile_95?: number;
+    percentile_99?: number;
+    response_time_over_time?: number[];
+    throughput_over_time?: number[];
+    error_rate_over_time?: number[];
+    error_details?: Array<{
+      message: string;
+      count: number;
+      sample?: any;
+    }>;
   };
 }
 
@@ -52,6 +69,7 @@ serve(async (req) => {
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL')
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
+    const jmeterPath = Deno.env.get('JMETER_PATH') || '/usr/bin/jmeter'
 
     if (!supabaseUrl || !supabaseServiceKey) {
       return new Response(
@@ -61,7 +79,13 @@ serve(async (req) => {
     }
 
     const requestData: ExecuteTestsRequest = await req.json()
-    const { projectId, testCaseIds, browserType = 'chrome', environment = 'staging' } = requestData
+    const { 
+      projectId, 
+      testCaseIds, 
+      browserType = 'chrome', 
+      environment = 'staging',
+      testType = 'functional'
+    } = requestData
 
     if (!projectId || !testCaseIds || testCaseIds.length === 0) {
       return new Response(
@@ -99,9 +123,26 @@ serve(async (req) => {
       )
     }
 
+    // Get test cases to determine test type if not specified
+    const { data: testCases, error: testCasesError } = await supabaseClient
+      .from('test_cases')
+      .select('*')
+      .in('id', testCaseIds)
+
+    if (testCasesError || !testCases || testCases.length === 0) {
+      return new Response(
+        JSON.stringify({ error: 'No test cases found' }),
+        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' }}
+      )
+    }
+
+    // Determine test type from test cases if not specified
+    const resolvedTestType = testType || 
+      (testCases.some(tc => tc.test_type === 'load') ? 'load' : 'functional')
+
     // Get environment URL
     const environmentUrl = getEnvironmentUrl(project, environment)
-    if (!environmentUrl) {
+    if (!environmentUrl && resolvedTestType === 'functional') {
       return new Response(
         JSON.stringify({ error: `No URL configured for ${environment} environment` }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }}
@@ -113,11 +154,17 @@ serve(async (req) => {
       .from('test_runs')
       .insert({
         project_id: projectId,
-        name: `Test Run - ${environment} - ${new Date().toISOString().slice(0, 19)}`,
+        name: `${resolvedTestType === 'load' ? 'Load' : 'Functional'} Test Run - ${environment} - ${new Date().toISOString().slice(0, 19)}`,
         environment: environment,
         status: 'running',
+        test_type: resolvedTestType,
         trigger_type: 'manual',
-        trigger_data: { browserType, testCaseIds, environmentUrl },
+        trigger_data: { 
+          browserType, 
+          testCaseIds, 
+          environmentUrl,
+          testType: resolvedTestType 
+        },
         started_by: userId,
         started_at: new Date().toISOString(),
         total_tests: testCaseIds.length,
@@ -141,24 +188,71 @@ serve(async (req) => {
         const initialData = JSON.stringify({
           success: true,
           testRunId: testRun.id,
-          message: 'Real test execution started',
+          message: 'Test execution started',
+          testType: resolvedTestType,
           environmentUrl
         })
         controller.enqueue(encoder.encode(`data: ${initialData}\n\n`))
 
-        // Execute REAL tests
-        await executeRealTests(
-          supabaseClient,
-          testRun.id,
-          testCaseIds,
-          browserType,
-          environmentUrl,
-          (update) => {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(update)}\n\n`))
+        try {
+          if (resolvedTestType === 'load') {
+            // Execute JMeter load tests
+            await executeLoadTests(
+              supabaseClient,
+              testRun.id,
+              testCases.filter(tc => tc.test_type === 'load'),
+              environmentUrl,
+              (update) => {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(update)}\n\n`))
+              }
+            )
+          } else {
+            // Execute functional tests with LambdaTest
+            await executeFunctionalTests(
+              supabaseClient,
+              testRun.id,
+              testCases.filter(tc => tc.test_type !== 'load'),
+              browserType,
+              environmentUrl,
+              (update) => {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(update)}\n\n`))
+              }
+            )
           }
-        )
 
-        controller.close()
+          // Mark test run as completed
+          await supabaseClient
+            .from('test_runs')
+            .update({
+              status: 'completed',
+              completed_at: new Date().toISOString()
+            })
+            .eq('id', testRun.id)
+
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            type: 'complete',
+            testType: resolvedTestType,
+            message: 'Test execution completed'
+          })}\n\n`))
+        } catch (error) {
+          console.error('Error during test execution:', error)
+          
+          await supabaseClient
+            .from('test_runs')
+            .update({
+              status: 'failed',
+              error_message: error.message,
+              completed_at: new Date().toISOString()
+            })
+            .eq('id', testRun.id)
+
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            type: 'error',
+            error: error.message
+          })}\n\n`))
+        } finally {
+          controller.close()
+        }
       }
     })
 
@@ -179,6 +273,472 @@ serve(async (req) => {
     )
   }
 })
+
+// BlazeMeter API Client
+class BlazeMeterClient {
+  private apiKey: string;
+  private apiUrl: string;
+
+  constructor(apiKey: string, apiUrl: string = 'https://a.blazemeter.com/api/v4') {
+    this.apiKey = apiKey;
+    this.apiUrl = apiUrl;
+  }
+
+  async createTest(jmxContent: string, testName: string): Promise<string> {
+    const response = await fetch(`${this.apiUrl}/tests`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': this.apiKey,
+      },
+      body: JSON.stringify({
+        name: testName,
+        configuration: {
+          type: 'jmeter',
+          script: jmxContent,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to create test: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    return data.result.id;
+  }
+
+  async startTest(testId: string): Promise<string> {
+    const response = await fetch(`${this.apiUrl}/tests/${testId}/start`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': this.apiKey,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to start test: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    return data.result.sessionId;
+  }
+
+  async getTestStatus(sessionId: string): Promise<any> {
+    const response = await fetch(`${this.apiUrl}/sessions/${sessionId}`, {
+      headers: {
+        'x-api-key': this.apiKey,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to get test status: ${response.statusText}`);
+    }
+
+    return await response.json();
+  }
+
+  async getTestReport(sessionId: string): Promise<any> {
+    const response = await fetch(`${this.apiUrl}/sessions/${sessionId}/reports/master`, {
+      headers: {
+        'x-api-key': this.apiKey,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to get test report: ${response.statusText}`);
+    }
+
+    return await response.json();
+  }
+
+  async stopTest(sessionId: string): Promise<void> {
+    await fetch(`${this.apiUrl}/sessions/${sessionId}/stop`, {
+      method: 'POST',
+      headers: {
+        'x-api-key': this.apiKey,
+      },
+    });
+  }
+}
+
+// Execute JMeter load tests
+async function executeLoadTests(
+  supabaseClient: any,
+  testRunId: string,
+  testCases: any[],
+  environmentUrl: string,
+  onProgress: (update: any) => void
+) {
+  const blazemeterApiKey = Deno.env.get('BLAZEMETER_API_KEY');
+  if (!blazemeterApiKey) {
+    throw new Error('BlazeMeter API key not configured');
+  }
+
+  const blazemeter = new BlazeMeterClient(blazemeterApiKey);
+
+  for (const testCase of testCases) {
+    try {
+      onProgress({
+        type: 'load_test_start',
+        testCaseId: testCase.id,
+        testName: testCase.name
+      });
+
+      // Generate JMX content
+      const jmxContent = generateJMXContent({
+        ...testCase.jmeter_config,
+        endpoints: testCase.jmeter_config.endpoints.map((endpoint: any) => ({
+          ...endpoint,
+          url: endpoint.url.startsWith('http') ? endpoint.url : `${environmentUrl}${endpoint.url}`
+        })),
+        testName: testCase.name
+      });
+
+      // Create test in BlazeMeter
+      const testId = await blazemeter.createTest(jmxContent, testCase.name);
+      onProgress({
+        type: 'load_test_created',
+        testCaseId: testCase.id,
+        testId
+      });
+
+      // Start the test
+      const sessionId = await blazemeter.startTest(testId);
+      onProgress({
+        type: 'load_test_started',
+        testCaseId: testCase.id,
+        sessionId
+      });
+
+      // Poll for test completion
+      let testStatus;
+      let lastProgress = 0;
+      do {
+        await new Promise(resolve => setTimeout(resolve, 10000)); // Check every 10 seconds
+        
+        testStatus = await blazemeter.getTestStatus(sessionId);
+        const progress = testStatus.result.progress || 0;
+        
+        if (progress > lastProgress) {
+          onProgress({
+            type: 'load_test_progress',
+            testCaseId: testCase.id,
+            progress,
+            status: testStatus.result.status
+          });
+          lastProgress = progress;
+        }
+      } while (testStatus.result.status === 'IN_PROGRESS' || testStatus.result.status === 'STARTING');
+
+      // Get final report
+      const report = await blazemeter.getTestReport(sessionId);
+      const metrics = extractBlazeMeterMetrics(report);
+
+      // Store results in Supabase
+      const { error } = await supabaseClient
+        .from('test_results')
+        .insert({
+          test_run_id: testRunId,
+          test_case_id: testCase.id,
+          status: metrics.error_rate > 0 ? 'fail' : 'pass',
+          duration_seconds: Math.round(metrics.duration / 1000),
+          load_test_metrics: metrics,
+          executed_at: new Date().toISOString(),
+          artifacts: [{
+            name: 'blazemeter-report.json',
+            type: 'application/json',
+            content: JSON.stringify(report),
+            encoding: 'utf8'
+          }]
+        });
+
+      if (error) throw error;
+
+      onProgress({
+        type: 'load_test_complete',
+        testCaseId: testCase.id,
+        metrics,
+        status: metrics.error_rate > 0 ? 'fail' : 'pass'
+      });
+
+    } catch (error) {
+      console.error(`Test case ${testCase.id} failed:`, error);
+      onProgress({
+        type: 'load_test_error',
+        testCaseId: testCase.id,
+        error: error.message
+      });
+    }
+  }
+}
+
+function extractBlazeMeterMetrics(report: any): any {
+  const summary = report.result.summary;
+  
+  return {
+    requests_per_second: summary.rps,
+    avg_response_time: summary.avgResponseTime,
+    error_rate: summary.errorRate * 100, // Convert to percentage
+    throughput: summary.throughput,
+    percentile_90: summary.pct90,
+    percentile_95: summary.pct95,
+    percentile_99: summary.pct99,
+    total_requests: summary.total,
+    failed_requests: summary.errors,
+    duration: summary.testDuration,
+    vusers: summary.vusers,
+    error_details: Object.entries(summary.errorsByType || {}).map(([type, count]) => ({
+      type,
+      count
+    })),
+    report_url: report.result.reportUrl
+  };
+}
+
+// Generate JMX content from configuration
+function generateJMXContent(config: any): string {
+  // This is a simplified version - in production you'd use a proper JMX template
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.5">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="${config.testName}" enabled="true">
+      <stringProp name="TestPlan.comments">${config.description || 'Generated by QA Autopilot'}</stringProp>
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+    </TestPlan>
+    <hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Thread Group" enabled="true">
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="Loop Controller" enabled="true">
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+          <intProp name="LoopController.loops">-1</intProp>
+        </elementProp>
+        <stringProp name="ThreadGroup.num_threads">${config.threads}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">${config.ramp_up}</stringProp>
+        <stringProp name="ThreadGroup.duration">${config.duration}</stringProp>
+        <stringProp name="ThreadGroup.delay">0</stringProp>
+      </ThreadGroup>
+      <hashTree>
+        ${config.endpoints.map((endpoint: any) => `
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="${endpoint.method} ${endpoint.url}" enabled="true">
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
+            <collectionProp name="Arguments.arguments">
+              ${endpoint.body ? `
+              <elementProp name="" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.value">${endpoint.body}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+              </elementProp>
+              ` : ''}
+            </collectionProp>
+          </elementProp>
+          <stringProp name="HTTPSampler.domain">${new URL(endpoint.url).hostname}</stringProp>
+          <stringProp name="HTTPSampler.port">${new URL(endpoint.url).port || ''}</stringProp>
+          <stringProp name="HTTPSampler.protocol">${new URL(endpoint.url).protocol.replace(':', '')}</stringProp>
+          <stringProp name="HTTPSampler.path">${new URL(endpoint.url).pathname}</stringProp>
+          <stringProp name="HTTPSampler.method">${endpoint.method}</stringProp>
+          <stringProp name="HTTPSampler.follow_redirects">true</stringProp>
+          <stringProp name="HTTPSampler.auto_redirects">false</stringProp>
+          <stringProp name="HTTPSampler.use_keepalive">true</stringProp>
+          <stringProp name="HTTPSampler.DO_MULTIPART_POST">false</stringProp>
+          <stringProp name="HTTPSampler.connect_timeout">5000</stringProp>
+          <stringProp name="HTTPSampler.response_timeout">15000</stringProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="HTTP Header Manager" enabled="true">
+            <collectionProp name="HeaderManager.headers">
+              <elementProp name="" elementType="Header">
+                <stringProp name="Header.name">Content-Type</stringProp>
+                <stringProp name="Header.value">application/json</stringProp>
+              </elementProp>
+              ${Object.entries(endpoint.headers || {}).map(([name, value]) => `
+              <elementProp name="" elementType="Header">
+                <stringProp name="Header.name">${name}</stringProp>
+                <stringProp name="Header.value">${value}</stringProp>
+              </elementProp>
+              `).join('')}
+            </collectionProp>
+          </HeaderManager>
+          <hashTree/>
+        </hashTree>
+        `).join('')}
+        
+        <ResultCollector guiclass="ViewResultsFullVisualizer" testclass="ResultCollector" testname="View Results Tree" enabled="false">
+          <boolProp name="ResultCollector.error_logging">false</boolProp>
+          <objProp>
+            <name>saveConfig</name>
+            <value class="SampleSaveConfiguration">
+              <time>true</time>
+              <latency>true</latency>
+              <timestamp>true</timestamp>
+              <success>true</success>
+              <label>true</label>
+              <code>true</code>
+              <message>true</message>
+              <threadName>true</threadName>
+              <dataType>true</dataType>
+              <encoding>false</encoding>
+              <assertions>true</assertions>
+              <subresults>true</subresults>
+              <responseData>false</responseData>
+              <samplerData>false</samplerData>
+              <xml>false</xml>
+              <fieldNames>true</fieldNames>
+              <responseHeaders>false</responseHeaders>
+              <requestHeaders>false</requestHeaders>
+              <responseDataOnError>false</responseDataOnError>
+              <saveAssertionResultsFailureMessage>true</saveAssertionResultsFailureMessage>
+              <assertionsResultsToSave>0</assertionsResultsToSave>
+              <bytes>true</bytes>
+              <sentBytes>true</sentBytes>
+              <url>true</url>
+              <threadCounts>true</threadCounts>
+              <idleTime>true</idleTime>
+              <connectTime>true</connectTime>
+            </value>
+          </objProp>
+          <stringProp name="filename">results.jtl</stringProp>
+        </ResultCollector>
+        <hashTree/>
+        
+        <Summariser guiclass="SummariserGui" testclass="Summariser" testname="Generate Summary Results" enabled="true"/>
+        <hashTree/>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>`
+}
+
+// Parse JMeter results file
+async function parseJMeterResults(resultFile: string): Promise<any> {
+  try {
+    const resultContent = await Deno.readTextFile(resultFile)
+    const lines = resultContent.split('\n').filter(line => line.trim() && !line.startsWith('timeStamp'))
+    
+    if (lines.length === 0) {
+      throw new Error('No results in JMeter output file')
+    }
+
+    const results = lines.map(line => {
+      const [
+        timeStamp, elapsed, label, responseCode, responseMessage, 
+        threadName, dataType, success, failureMessage, bytes, 
+        sentBytes, grpThreads, allThreads, URL, Latency, 
+        IdleTime, Connect
+      ] = line.split(',')
+
+      return {
+        elapsed: parseInt(elapsed),
+        responseCode,
+        success: success === 'true',
+        bytes: parseInt(bytes),
+        latency: parseInt(Latency),
+        connectTime: parseInt(Connect)
+      }
+    })
+
+    const totalRequests = results.length
+    const failedRequests = results.filter(r => !r.success).length
+    const errorRate = (failedRequests / totalRequests) * 100
+    const avgResponseTime = results.reduce((sum, r) => sum + r.elapsed, 0) / totalRequests
+    const throughput = results.reduce((sum, r) => sum + r.bytes, 0) / 1024 // KB
+    const requestsPerSecond = totalRequests / (results[results.length - 1].elapsed / 1000)
+
+    // Calculate percentiles
+    const sortedTimes = results.map(r => r.elapsed).sort((a, b) => a - b)
+    const percentile90 = sortedTimes[Math.floor(sortedTimes.length * 0.9)]
+    const percentile95 = sortedTimes[Math.floor(sortedTimes.length * 0.95)]
+    const percentile99 = sortedTimes[Math.floor(sortedTimes.length * 0.99)]
+
+    // Group errors
+    const errorDetails = results
+      .filter(r => !r.success)
+      .reduce((acc: Record<string, {count: number, sample: any}>, r) => {
+        const key = r.responseCode
+        if (!acc[key]) {
+          acc[key] = { count: 0, sample: r }
+        }
+        acc[key].count++
+        return acc
+      }, {})
+
+    return {
+      requests_per_second: parseFloat(requestsPerSecond.toFixed(2)),
+      avg_response_time: parseFloat(avgResponseTime.toFixed(2)),
+      error_rate: parseFloat(errorRate.toFixed(2)),
+      throughput: parseFloat(throughput.toFixed(2)),
+      percentile_90: percentile90,
+      percentile_95: percentile95,
+      percentile_99: percentile99,
+      total_requests: totalRequests,
+      failed_requests: failedRequests,
+      error_details: Object.entries(errorDetails).map(([code, data]) => ({
+        message: code,
+        count: data.count,
+        sample: data.sample
+      }))
+    }
+  } catch (error) {
+    console.error('Failed to parse JMeter results:', error)
+    return {
+      requests_per_second: 0,
+      avg_response_time: 0,
+      error_rate: 100,
+      throughput: 0,
+      percentile_90: 0,
+      percentile_95: 0,
+      percentile_99: 0,
+      total_requests: 0,
+      failed_requests: 0,
+      error_details: []
+    }
+  }
+}
+
+// Aggregate metrics from multiple load tests
+function aggregateLoadTestMetrics(results: any[]): any {
+  if (!results || results.length === 0) {
+    return {
+      requests_per_second: 0,
+      avg_response_time: 0,
+      error_rate: 0,
+      throughput: 0,
+      percentile_90: 0,
+      percentile_95: 0,
+      percentile_99: 0,
+      total_requests: 0,
+      failed_requests: 0
+    }
+  }
+
+  const metrics = results
+    .map(r => r.load_test_metrics)
+    .filter(m => m)
+
+  return {
+    requests_per_second: average(metrics, 'requests_per_second'),
+    avg_response_time: average(metrics, 'avg_response_time'),
+    error_rate: average(metrics, 'error_rate'),
+    throughput: average(metrics, 'throughput'),
+    percentile_90: average(metrics, 'percentile_90'),
+    percentile_95: average(metrics, 'percentile_95'),
+    percentile_99: average(metrics, 'percentile_99'),
+    total_requests: sum(metrics, 'total_requests'),
+    failed_requests: sum(metrics, 'failed_requests')
+  }
+}
+
+function average(items: any[], key: string): number {
+  const values = items.map(i => i[key]).filter(v => v !== undefined)
+  if (values.length === 0) return 0
+  return parseFloat((values.reduce((a, b) => a + b, 0) / values.length).toFixed(2))
+}
+
+function sum(items: any[], key: string): number {
+  return items.map(i => i[key] || 0).reduce((a, b) => a + b, 0)
+}
 
 // REAL test execution with browser automation
 async function executeRealTests(

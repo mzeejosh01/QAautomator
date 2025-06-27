@@ -299,14 +299,18 @@ const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
       // Generate initial test cases based on repository analysis
       if (repoAnalysis) {
         try {
-          await api.generateTests(newProject.id, "repository_analysis", {
-            repositoryStructure: {
-              framework: repoAnalysis.framework,
-              components: repoAnalysis.components,
-              pages: repoAnalysis.pages,
-              recommended_tests: repoAnalysis.recommended_tests,
-            },
-          });
+          await api.generateFunctionalTests(
+            newProject.id,
+            "repository_analysis",
+            {
+              repositoryStructure: {
+                framework: repoAnalysis.framework,
+                components: repoAnalysis.components,
+                pages: repoAnalysis.pages,
+                recommended_tests: repoAnalysis.recommended_tests,
+              },
+            }
+          );
         } catch (generateError) {
           console.warn("Initial test generation failed:", generateError);
           // Don't fail project creation if test generation fails

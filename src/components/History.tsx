@@ -14,6 +14,14 @@ import {
   AlertTriangle,
   Maximize2,
   X,
+  Zap,
+  Gauge,
+  Activity,
+  BarChart2,
+  Timer,
+  TrendingUp,
+  AlertOctagon,
+  ExternalLink,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -36,6 +44,18 @@ import {
   supabase,
 } from "@/lib/supabase";
 import { toast } from "@/hooks/use-toast";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+} from "recharts";
 
 const History = () => {
   const { currentProject, projects } = useApp();
@@ -234,7 +254,6 @@ const History = () => {
 
   const parseFailureDetails = (result: TestResult) => {
     try {
-      // Try to parse logs as JSON first (for structured failure details)
       if (result.logs && result.logs.startsWith("{")) {
         return JSON.parse(result.logs);
       }
@@ -246,8 +265,6 @@ const History = () => {
 
   const formatLogs = (logs: string | undefined) => {
     if (!logs) return [];
-
-    // Split by newline and format each log entry
     return logs.split("\n").filter((line) => line.trim());
   };
 
@@ -274,6 +291,245 @@ const History = () => {
             );
           })}
         </pre>
+      </div>
+    );
+  };
+
+  const LoadTestMetrics = ({
+    metrics,
+    testRunId,
+  }: {
+    metrics: any;
+    testRunId?: string;
+  }) => {
+    if (!metrics) return null;
+
+    // Prepare data for charts
+    const responseTimeData = metrics.response_time_over_time?.map(
+      (point: any, index: number) => ({
+        time: index,
+        responseTime: point,
+      })
+    );
+
+    const throughputData = metrics.throughput_over_time?.map(
+      (point: any, index: number) => ({
+        time: index,
+        throughput: point,
+      })
+    );
+
+    const errorRateData = metrics.error_rate_over_time?.map(
+      (point: any, index: number) => ({
+        time: index,
+        errorRate: point,
+      })
+    );
+
+    return (
+      <div className="space-y-6">
+        {/* Key Metrics */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <Card>
+            <CardContent className="pt-6">
+              <div className="flex items-center gap-3">
+                <Gauge className="w-6 h-6 text-blue-600" />
+                <div>
+                  <div className="text-2xl font-bold">
+                    {metrics.requests_per_second || 0}
+                  </div>
+                  <div className="text-sm text-gray-600">Requests/sec</div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="pt-6">
+              <div className="flex items-center gap-3">
+                <Timer className="w-6 h-6 text-green-600" />
+                <div>
+                  <div className="text-2xl font-bold">
+                    {metrics.avg_response_time || 0}ms
+                  </div>
+                  <div className="text-sm text-gray-600">Avg Response</div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="pt-6">
+              <div className="flex items-center gap-3">
+                <AlertOctagon className="w-6 h-6 text-red-600" />
+                <div>
+                  <div className="text-2xl font-bold">
+                    {metrics.error_rate || 0}%
+                  </div>
+                  <div className="text-sm text-gray-600">Error Rate</div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="pt-6">
+              <div className="flex items-center gap-3">
+                <TrendingUp className="w-6 h-6 text-purple-600" />
+                <div>
+                  <div className="text-2xl font-bold">
+                    {metrics.throughput || 0}
+                  </div>
+                  <div className="text-sm text-gray-600">Throughput (KB/s)</div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Response Time Chart */}
+        {responseTimeData && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Activity className="w-5 h-5" />
+                Response Time Over Time
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={responseTimeData}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="time" label="Time (seconds)" />
+                  <YAxis label="ms" />
+                  <Tooltip />
+                  <Legend />
+                  <Line
+                    type="monotone"
+                    dataKey="responseTime"
+                    stroke="#3b82f6"
+                    activeDot={{ r: 8 }}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Throughput Chart */}
+        {throughputData && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <BarChart2 className="w-5 h-5" />
+                Throughput Over Time
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={throughputData}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="time" label="Time (seconds)" />
+                  <YAxis label="req/sec" />
+                  <Tooltip />
+                  <Legend />
+                  <Bar dataKey="throughput" fill="#10b981" />
+                </BarChart>
+              </ResponsiveContainer>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Error Rate Chart */}
+        {errorRateData && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <AlertTriangle className="w-5 h-5 text-yellow-600" />
+                Error Rate Over Time
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={errorRateData}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="time" label="Time (seconds)" />
+                  <YAxis label="%" />
+                  <Tooltip />
+                  <Legend />
+                  <Line type="monotone" dataKey="errorRate" stroke="#ef4444" />
+                </LineChart>
+              </ResponsiveContainer>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Percentile Metrics */}
+        <Card>
+          <CardHeader>
+            <CardTitle>Response Time Percentiles</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="border rounded-lg p-4">
+                <div className="text-sm text-gray-500">90th Percentile</div>
+                <div className="text-2xl font-bold">
+                  {metrics.percentile_90 || 0}ms
+                </div>
+                <div className="text-xs text-gray-500">
+                  90% of requests were faster than this
+                </div>
+              </div>
+              <div className="border rounded-lg p-4">
+                <div className="text-sm text-gray-500">95th Percentile</div>
+                <div className="text-2xl font-bold">
+                  {metrics.percentile_95 || 0}ms
+                </div>
+                <div className="text-xs text-gray-500">
+                  95% of requests were faster than this
+                </div>
+              </div>
+              <div className="border rounded-lg p-4">
+                <div className="text-sm text-gray-500">99th Percentile</div>
+                <div className="text-2xl font-bold">
+                  {metrics.percentile_99 || 0}ms
+                </div>
+                <div className="text-xs text-gray-500">
+                  99% of requests were faster than this
+                </div>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Error Details */}
+        {metrics.error_details && metrics.error_details.length > 0 && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-red-600">
+                <XCircle className="w-5 h-5" />
+                Error Details
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="space-y-3">
+                {metrics.error_details.map((error: any, index: number) => (
+                  <div key={index} className="border rounded-lg p-3">
+                    <div className="font-medium">{error.message}</div>
+                    <div className="text-sm text-gray-600">
+                      Count: {error.count}
+                    </div>
+                    {error.sample && (
+                      <div className="mt-2">
+                        <div className="text-xs text-gray-500">Sample:</div>
+                        <div className="bg-gray-50 p-2 rounded text-xs font-mono">
+                          {JSON.stringify(error.sample, null, 2)}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
+        )}
       </div>
     );
   };
@@ -461,19 +717,41 @@ const History = () => {
                         </div>
                         <div className="text-center">
                           <div className="font-medium">
-                            {run.total_tests} tests
+                            {run.test_type === "load" ? (
+                              <div className="flex items-center gap-1">
+                                <Zap className="w-4 h-4 text-yellow-500" />
+                                Load Test
+                              </div>
+                            ) : (
+                              `${run.total_tests} tests`
+                            )}
                           </div>
                           <div className="text-gray-500">
                             {formatDuration(run.duration_seconds)}
                           </div>
                         </div>
                         <div className="text-center">
-                          <div className="font-medium text-green-600">
-                            {run.passed_tests} passed
-                          </div>
-                          <div className="text-red-600">
-                            {run.failed_tests} failed
-                          </div>
+                          {run.test_type === "load" ? (
+                            <div>
+                              <div className="font-medium text-blue-600">
+                                {run.load_test_metrics?.requests_per_second ||
+                                  0}{" "}
+                                RPS
+                              </div>
+                              <div className="text-red-600">
+                                {run.load_test_metrics?.error_rate || 0}% errors
+                              </div>
+                            </div>
+                          ) : (
+                            <>
+                              <div className="font-medium text-green-600">
+                                {run.passed_tests} passed
+                              </div>
+                              <div className="text-red-600">
+                                {run.failed_tests} failed
+                              </div>
+                            </>
+                          )}
                         </div>
                         <div className="text-center">
                           <Badge
@@ -490,9 +768,19 @@ const History = () => {
                         </div>
                         <div className="text-center">
                           <div className="text-lg font-bold">
-                            {getSuccessRate(run.passed_tests, run.total_tests)}%
+                            {run.test_type === "load"
+                              ? run.load_test_metrics?.error_rate
+                                ? 100 - run.load_test_metrics.error_rate
+                                : 100
+                              : getSuccessRate(
+                                  run.passed_tests,
+                                  run.total_tests
+                                )}
+                            %
                           </div>
-                          <div className="text-xs text-gray-500">success</div>
+                          <div className="text-xs text-gray-500">
+                            {run.test_type === "load" ? "success" : "passed"}
+                          </div>
                         </div>
                       </div>
                     </div>
@@ -508,9 +796,11 @@ const History = () => {
                           <div className="bg-white rounded-lg p-3 mb-4 text-sm">
                             <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
                               <div>
-                                <span className="text-gray-500">Browser:</span>{" "}
+                                <span className="text-gray-500">Type:</span>{" "}
                                 <span className="font-medium">
-                                  {run.trigger_data?.browserType || "Chrome"}
+                                  {run.test_type === "load"
+                                    ? "Load Test"
+                                    : "Functional Test"}
                                 </span>
                               </div>
                               <div>
@@ -522,22 +812,29 @@ const History = () => {
                                 </span>
                               </div>
                               <div>
-                                <span className="text-gray-500">
-                                  Test Suite:
-                                </span>{" "}
-                                <span className="font-medium">
-                                  {run.trigger_data?.testCaseIds?.length || 0}{" "}
-                                  tests
-                                </span>
-                              </div>
-                              <div>
                                 <span className="text-gray-500">Run ID:</span>{" "}
                                 <span className="font-mono text-xs">
                                   {run.id.slice(0, 8)}...
                                 </span>
                               </div>
+                              <div>
+                                <span className="text-gray-500">Duration:</span>{" "}
+                                <span className="font-medium">
+                                  {formatDuration(run.duration_seconds)}
+                                </span>
+                              </div>
                             </div>
                           </div>
+
+                          {/* Load Test Metrics - Updated to pass testRunId */}
+                          {run.test_type === "load" && (
+                            <div className="mb-6">
+                              <LoadTestMetrics
+                                metrics={run.load_test_metrics}
+                                testRunId={run.id}
+                              />
+                            </div>
+                          )}
 
                           {loadingResults.has(run.id) ? (
                             <div className="text-center py-4">
@@ -636,6 +933,12 @@ const History = () => {
                                             {failureDetails && (
                                               <TabsTrigger value="failure">
                                                 Failure Analysis
+                                              </TabsTrigger>
+                                            )}
+                                            {result.load_test_metrics && (
+                                              <TabsTrigger value="metrics">
+                                                <Activity className="w-4 h-4 mr-2" />
+                                                Metrics
                                               </TabsTrigger>
                                             )}
                                           </TabsList>
@@ -930,6 +1233,19 @@ const History = () => {
                                               </div>
                                             </TabsContent>
                                           )}
+
+                                          {result.load_test_metrics && (
+                                            <TabsContent
+                                              value="metrics"
+                                              className="mt-4"
+                                            >
+                                              <LoadTestMetrics
+                                                metrics={
+                                                  result.load_test_metrics
+                                                }
+                                              />
+                                            </TabsContent>
+                                          )}
                                         </Tabs>
                                       </div>
                                     )}
@@ -968,6 +1284,7 @@ const History = () => {
             <button
               className="absolute top-4 right-4 text-white bg-black bg-opacity-50 rounded-full p-2 hover:bg-opacity-70"
               onClick={() => setFullscreenImage(null)}
+              title="Close fullscreen image"
             >
               <X className="w-6 h-6" />
             </button>

@@ -1,5 +1,4 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-// src/lib/supabase.ts
 import { createClient } from '@supabase/supabase-js'
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
@@ -41,11 +40,25 @@ export interface TestCase {
   project_id: string
   name: string
   description?: string
+  test_type?: 'functional' | 'load'
   steps: Array<{
     action: string
     expected_result: string
   }>
   test_data: Record<string, any>
+  jmeter_config?: {
+    test_plan?: string
+    threads: number
+    ramp_up: number
+    duration: number
+    target_tps?: number
+    endpoints?: Array<{
+      url: string
+      method: string
+      body?: string
+      headers?: Record<string, string>
+    }>
+  }
   priority: 'Low' | 'Medium' | 'High'
   category?: string
   created_by?: string
@@ -59,6 +72,7 @@ export interface TestRun {
   name: string
   environment: string
   status: 'pending' | 'running' | 'completed' | 'failed'
+  test_type: 'functional' | 'load'
   trigger_type: 'manual' | 'github_pr' | 'scheduled'
   trigger_data: Record<string, any>
   started_by?: string
@@ -68,6 +82,17 @@ export interface TestRun {
   passed_tests: number
   failed_tests: number
   duration_seconds?: number
+  load_test_metrics?: {
+    requests_per_second: number
+    avg_response_time: number
+    error_rate: number
+    percentile_90: number
+    percentile_95: number
+    percentile_99: number
+    throughput: number
+    total_requests: number
+    total_errors: number
+  }
 }
 
 export interface TestResult {
@@ -80,6 +105,12 @@ export interface TestResult {
   screenshots: string[]
   duration_seconds?: number
   executed_at: string
+  load_test_metrics?: {
+    response_time: number
+    latency: number
+    bytes: number
+    success: boolean
+  }
 }
 
 // Auth helpers
@@ -127,34 +158,29 @@ export const auth = {
 
 // API helpers
 export const api = {
-  // Projects
- getProjects: async () => {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) throw new Error('User must be authenticated');
-  
-  const { data, error } = await supabase
-    .from('projects')
-    .select('*')
-    .eq('owner_id', user.id) 
-    .order('created_at', { ascending: false });
-  
-  if (error) throw error;
-  return data;
-},
+  getProjects: async () => {
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) throw new Error('User must be authenticated')
+    
+    const { data, error } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('owner_id', user.id)
+      .order('created_at', { ascending: false })
+    
+    if (error) throw error
+    return data
+  },
 
   createProject: async (project: Partial<Project>) => {
-    // Get current user to set as owner
     const { data: { user } } = await supabase.auth.getUser()
-    
-    if (!user) {
-      throw new Error('User must be authenticated to create a project')
-    }
+    if (!user) throw new Error('User must be authenticated to create a project')
 
     const { data, error } = await supabase
       .from('projects')
       .insert({
         ...project,
-        owner_id: user.id, // Set current user as owner
+        owner_id: user.id,
       })
       .select()
       .single()
@@ -175,7 +201,6 @@ export const api = {
     return data
   },
 
-  // Test Cases
   getTestCases: async (projectId: string) => {
     const { data, error } = await supabase
       .from('test_cases')
@@ -187,11 +212,43 @@ export const api = {
     return data
   },
 
-  // Test Runs
+  uploadJMeterTestPlan: async (
+    projectId: string,
+    jmxContent: string,
+    config: {
+      name: string
+      description?: string
+      threads: number
+      ramp_up: number
+      duration: number
+    }
+  ) => {
+    const { data, error } = await supabase
+      .from('test_cases')
+      .insert({
+        project_id: projectId,
+        name: config.name,
+        description: config.description || `JMeter load test - ${config.name}`,
+        test_type: 'load',
+        jmeter_config: {
+          test_plan: jmxContent,
+          threads: config.threads,
+          ramp_up: config.ramp_up,
+          duration: config.duration,
+        },
+        priority: 'Medium',
+      })
+      .select()
+      .single()
+    
+    if (error) throw error
+    return data
+  },
+
   getTestRuns: async (projectId?: string) => {
     let query = supabase
       .from('test_runs')
-      .select('*')  // Removed projects join to avoid foreign key issues
+      .select('*')
       .order('created_at', { ascending: false })
     
     if (projectId) {
@@ -203,11 +260,10 @@ export const api = {
     return data
   },
 
-  // FIXED: Remove the problematic join with test_cases
   getTestResults: async (testRunId: string) => {
     const { data, error } = await supabase
       .from('test_results')
-      .select('*')  // Removed test_cases join - this was causing the error!
+      .select('*')
       .eq('test_run_id', testRunId)
       .order('executed_at', { ascending: false })
     
@@ -215,7 +271,6 @@ export const api = {
     return data
   },
 
-  // Profile
   getProfile: async () => {
     const { data, error } = await supabase
       .from('profiles')
@@ -238,28 +293,49 @@ export const api = {
     return data
   },
 
-  // Edge Functions
-  generateTests: async (
+ generateFunctionalTests: async (
     projectId: string,
     sourceType: 'description' | 'github_pr' | 'repository_analysis',
-    sourceData: any
+    sourceData: {
+      description?: string;
+      prUrl?: string;
+      repositoryStructure?: any;
+    }
   ) => {
-    const { data, error } = await supabase.functions.invoke('generate-tests', {
+    const { data, error } = await supabase.functions.invoke('generate-functional-tests', {
       body: {
         projectId,
         sourceType,
         sourceData,
       },
-    })
+    });
     
-    if (error) throw error
-    return data
+    if (error) throw error;
+    return data;
+  },
+
+   generateLoadTests: async (
+    projectId: string,
+    sourceType: 'api_endpoints' | 'url_analysis' | 'custom_config',
+    sourceData: any
+  ) => {
+    const { data, error } = await supabase.functions.invoke('generate-load-tests', {
+      body: {
+        projectId,
+        sourceType,
+        sourceData,
+      },
+    });
+    
+    if (error) throw error;
+    return data;
   },
 
   executeTests: async (
     projectId: string,
     testCaseIds: string[],
     environment: string,
+    testType: 'functional' | 'load' = 'functional',
     triggerType: 'manual' | 'github_pr' | 'scheduled' = 'manual',
     triggerData?: any
   ) => {
@@ -268,8 +344,77 @@ export const api = {
         projectId,
         testCaseIds,
         environment,
+        testType,
         triggerType,
         triggerData,
+      },
+    })
+
+    
+    
+    if (error) throw error
+    return data
+  },
+
+  executeFunctionalTests: async (
+  projectId: string,
+  testCaseIds: string[],
+  environment: string,
+  browserType: string = 'chrome'
+) => {
+  const { data, error } = await supabase.functions.invoke('execute-functional-tests', {
+    body: {
+      projectId,
+      testCaseIds,
+      environment,
+      browserType
+    },
+  });
+  
+  if (error) throw error;
+  return data;
+},
+
+ // In your API helpers section, replace executeTests with:
+executeLoadTests: async (
+  projectId: string,
+  testCaseIds: string[],
+  environment: string,
+  config?: {
+    threads?: number;
+    rampUp?: number;
+    duration?: number;
+  }
+) => {
+  const { data, error } = await supabase.functions.invoke('execute-load-tests', {
+    body: {
+      projectId,
+      testCaseIds,
+      environment,
+      loadTestConfig: config,
+    },
+  });
+  
+  if (error) throw error;
+  return data;
+},
+
+  executeJMeterTest: async (
+    projectId: string,
+    testCaseId: string,
+    environment: string,
+    config?: {
+      threads?: number
+      ramp_up?: number
+      duration?: number
+    }
+  ) => {
+    const { data, error } = await supabase.functions.invoke('execute-jmeter-test', {
+      body: {
+        projectId,
+        testCaseId,
+        environment,
+        config,
       },
     })
     
@@ -301,6 +446,7 @@ export const api = {
     if (error) throw error
     return data
   },
+
 }
 
 // Real-time subscriptions
@@ -331,6 +477,22 @@ export const subscriptions = {
           schema: 'public',
           table: 'test_results',
           filter: `test_run_id=eq.${testRunId}`,
+        },
+        callback
+      )
+      .subscribe()
+  },
+
+  subscribeToJMeterTest: (testRunId: string, callback: (payload: any) => void) => {
+    return supabase
+      .channel('jmeter_test')
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'test_runs',
+          filter: `id=eq.${testRunId}`,
         },
         callback
       )
